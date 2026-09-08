@@ -1,0 +1,42 @@
+# Python / IDE
+__pycache__/
+.vscode/
+debug/
+
+# Experiments & outputs
+exps/
+test_*/
+official_benchmark_rerun/
+fivefold_logs/
+generalization_logs/
+presence_conformal_lovo/
+presence_continuity_generalization/
+presence_gate_eval/
+presence_operator_eval/
+presence_percentile_fusion/
+presence_srqs_eval/
+
+# Models & weights
+pretrained_model/*
+*.pth
+*.pt
+*.ckpt
+
+# Datasets & archives
+data/
+FAME-main/
+FAME-main.zip
+fame_protosam/
+fame_protosam.zip
+ProtoSAM-main.zip
+
+# Logs & scratch
+*.log
+*.logcd
+spen_log.txt
+presence_scores.csv
+*.bak
+
+# Large binaries
+*.pdf
+*.zip
