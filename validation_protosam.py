@@ -9,6 +9,7 @@ import csv
 import shutil
 import torch
 import torch.nn as nn
+import torch.nn.functional as nnF
 import torch.optim as optim
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
@@ -20,6 +21,19 @@ import matplotlib.pyplot as plt
 from models.ProtoSAM import ProtoSAM,  ALPNetWrapper, SamWrapperWrapper, InputFactory, ModelWrapper, TYPE_ALPNET, TYPE_SAM
 from models.ProtoMedSAM import ProtoMedSAM
 from models.grid_proto_fewshot import FewShotSeg
+from models.qspa import (
+    resolve_support_selection,
+    uses_dino_support_pool,
+    selection_top_k,
+    select_topk_supports_by_dino_sim,
+)
+from models.polyp_support import (
+    build_support_pool_by_dataset,
+    pool_summary,
+    resolve_pool_indices,
+    resolve_query_dataset,
+    select_random_matched_support,
+)
 from models.segment_anything.utils.transforms import ResizeLongestSide
 from models.SamWrapper import SamWrapper
 # from dataloaders.PolypDataset import get_polyp_dataset, get_vps_easy_unseen_dataset, get_vps_hard_unseen_dataset, PolypDataset, KVASIR, CVC300, COLON_DB, ETIS_DB, CLINIC_DB
@@ -354,11 +368,44 @@ def get_model(_config) -> ProtoSAM:
     return model
 
 
+def get_fewshot_seg(model) -> FewShotSeg:
+    coarse = model.coarse_segmentation_model
+    if hasattr(coarse, "model"):
+        return coarse.model
+    return coarse
+
+
 def get_support_set_polyps(_config, dataset:PolypDataset):
     n_support = _config["n_support"]
-    (support_images, support_labels, case) = dataset.get_support(n_support=n_support)
+    text_file = _config.get("support_txt_file", None)
+    (support_images, support_labels, case) = dataset.get_support(
+        n_support=n_support, text_file=text_file)
     
     return support_images, support_labels, case
+
+
+@torch.no_grad()
+def precompute_polyp_support_embeddings(encoder: FewShotSeg, dataset: PolypDataset, pool_paths, batch_size=4, device="cuda"):
+    """Cache L2-normalized DINO embeddings for the polyp support pool."""
+    embs = []
+    for i in tqdm(range(0, len(pool_paths), batch_size), desc="support DINO embeddings"):
+        batch_imgs = []
+        for image_path, gt_path in pool_paths[i:i + batch_size]:
+            img, _, _ = dataset.load_support_item(image_path, gt_path)
+            batch_imgs.append(img)
+        x = torch.cat(batch_imgs, dim=0).to(device)
+        embs.append(encoder.get_image_embedding(x).cpu())
+        del x
+    return torch.cat(embs, dim=0)
+
+
+@torch.no_grad()
+def select_polyp_support_by_dino_sim(encoder, query_images, support_embs, pool_paths, dataset: PolypDataset):
+    """Legacy top-1 wrapper. Prefer select_topk_supports_by_dino_sim."""
+    images, masks, cases, weights, info = select_topk_supports_by_dino_sim(
+        encoder, query_images, support_embs, pool_paths, dataset, top_k=1, temperature=0.07)
+    best = info["selected_indices"][0]
+    return images, masks, cases[0], best, info["selected_similarities"][0]
 
 
 def get_support_set_alpds(config, dataset:ValidationDataset):
@@ -404,7 +451,18 @@ def main(_run, _config, _log):
             _run.observers[0].save_file(source_file, f'source/{source_file}')
         print(f"####### created dir:{_run.observers[0].dir} #######")
         shutil.rmtree(f'{_run.observers[0].basedir}/_sources')
-    print(f"config do_cca: {_config['do_cca']}, use_bbox: {_config['use_bbox']}")
+    support_selection = resolve_support_selection(_config)
+    qspa_top_k = selection_top_k(support_selection, _config.get("top_k", 5))
+    qspa_temp = float(_config.get("prototype_temperature", 0.07))
+    polyp_match_support = bool(_config.get("polyp_match_support_to_query", False))
+    polyp_unmatched_policy = _config.get("polyp_unmatched_support_policy", "skip")
+    print(
+        f"config do_cca: {_config['do_cca']}, use_bbox: {_config['use_bbox']}, "
+        f"support_select_mode: {_config.get('support_select_mode', 'random')}, "
+        f"support_selection: {support_selection}, top_k: {qspa_top_k}, T: {qspa_temp}, "
+        f"polyp_match_support_to_query: {polyp_match_support}, "
+        f"polyp_unmatched_support_policy: {polyp_unmatched_policy}"
+    )
     cudnn.enabled = True
     cudnn.benchmark = True
     torch.cuda.set_device(device=_config['gpu_id'])
@@ -414,10 +472,25 @@ def main(_run, _config, _log):
     model = get_model(_config)
     model = model.to(torch.device("cuda"))
     model.eval()
+    if hasattr(model, "coarse_segmentation_model"):
+        model.coarse_segmentation_model.eval()
     
     sam_trans = ResizeLongestSide(1024)
     if POLYPS in _config["dataset"].lower():
         tr_dataset, te_dataset = get_polyp_dataset(sam_trans=sam_trans, image_size=(1024, 1024))
+        eval_ds = _config.get("polyp_eval_datasets", None)
+        if eval_ds:
+            if isinstance(eval_ds, str):
+                eval_ds = [eval_ds]
+            keep_img, keep_gt = [], []
+            for img, gt in zip(te_dataset.images, te_dataset.gts):
+                if any(name in img for name in eval_ds):
+                    keep_img.append(img)
+                    keep_gt.append(gt)
+            te_dataset.images = keep_img
+            te_dataset.gts = keep_gt
+            te_dataset.size = len(keep_img)
+            _log.info(f'Polyp eval subsets {list(eval_ds)}: {te_dataset.size} images')
     elif CHAOS in _config["dataset"].lower() or SABS in _config["dataset"].lower():
         tr_dataset, te_dataset = get_nii_dataset(_config, _config["input_size"][0]) 
     else:
@@ -461,9 +534,33 @@ def main(_run, _config, _log):
     MAX_SUPPORT_IMAGES = 1
     is_alp_ds = any(item in _config["dataset"].lower() for item in ALP_DS)
     is_polyp_ds  = POLYPS in _config["dataset"].lower()
+    support_select_mode = _config.get("support_select_mode", "random")
+    polyp_pool_paths = None
+    polyp_pool_by_dataset = None
+    polyp_support_embs = None
+    fewshot_seg = None
+    qspa_weights = None
+    qspa_info = None
+    polyp_support_skipped = 0
     
     if is_alp_ds:
         all_support_images, all_support_fg_mask, support_scan_id = get_support_set(_config, te_dataset)
+    elif is_polyp_ds and (uses_dino_support_pool(support_selection) or polyp_match_support):
+        polyp_pool_paths = tr_dataset.get_support_pool_paths(
+            text_file=_config.get("support_txt_file", None)
+        )
+        polyp_pool_by_dataset = build_support_pool_by_dataset(polyp_pool_paths)
+        _log.info(
+            f'Polyp support pool size: {len(polyp_pool_paths)} '
+            f'by_dataset={pool_summary(polyp_pool_by_dataset)} '
+            f'match_query={polyp_match_support} selection={support_selection} top_k={qspa_top_k}'
+        )
+        if uses_dino_support_pool(support_selection):
+            fewshot_seg = get_fewshot_seg(model)
+            fewshot_seg.eval()
+            polyp_support_embs = precompute_polyp_support_embeddings(
+                fewshot_seg, tr_dataset, polyp_pool_paths)
+            polyp_support_embs = polyp_support_embs.cuda()
     elif is_polyp_ds:
         support_images, support_fg_mask, case = get_support_set_polyps(_config, tr_dataset)
         
@@ -500,6 +597,50 @@ def main(_run, _config, _log):
             gt_present = bool((query_labels > 0).any().item())
             if not gt_present and _config["skip_no_organ_slices"]:
                 continue
+
+            qspa_weights = None
+            qspa_info = None
+            if is_polyp_ds and polyp_pool_paths is not None and polyp_pool_by_dataset is not None:
+                query_dataset = resolve_query_dataset(sample_batched)
+                pool_indices = None
+                if polyp_match_support:
+                    pool_indices, _ = resolve_pool_indices(
+                        polyp_pool_by_dataset, query_dataset, polyp_unmatched_policy)
+                    if pool_indices is None:
+                        polyp_support_skipped += 1
+                        continue
+
+                if uses_dino_support_pool(support_selection):
+                    support_images, support_fg_mask, _, qspa_weights, qspa_info = select_topk_supports_by_dino_sim(
+                        fewshot_seg, query_images, polyp_support_embs, polyp_pool_paths, tr_dataset,
+                        top_k=qspa_top_k, temperature=qspa_temp,
+                        pool_indices=pool_indices, query_dataset=query_dataset)
+                    model.last_qspa_info = {
+                        k: v for k, v in qspa_info.items() if k != "all_similarities"
+                    }
+                    if _config.get("debug"):
+                        _log.info(
+                            f"QSPA ranked top-{qspa_info['top_k']} dataset={query_dataset}: {qspa_info['ranked']}"
+                        )
+                elif polyp_match_support:
+                    support_images, support_fg_mask, match_info = select_random_matched_support(
+                        polyp_pool_paths,
+                        polyp_pool_by_dataset,
+                        query_dataset,
+                        tr_dataset.load_support_item,
+                        n_support=_config.get("n_support", 1),
+                        seed=_config.get("seed", 42),
+                        query_index=idx,
+                        unmatched_policy=polyp_unmatched_policy,
+                    )
+                    if support_images is None:
+                        polyp_support_skipped += 1
+                        continue
+                    if _config.get("debug"):
+                        _log.info(
+                            f"Matched random support dataset={query_dataset} "
+                            f"indices={match_info['selected_indices']}"
+                        )
             
             n_try = 1
             with torch.no_grad():
@@ -535,6 +676,7 @@ def main(_run, _config, _log):
                                             original_sz=query_images.shape[-2:],
                                             img_sz=query_images.shape[-2:],
                                             gts=query_labels,
+                                            support_weights=qspa_weights,
                     )
                     coarse_model_input.to(torch.device("cuda"))
                         
@@ -653,11 +795,21 @@ def main(_run, _config, _log):
                 plot_pred_gt_support(query_images[0,0].cpu(), query_pred.cpu(), query_labels[0].cpu(
                     ), support_images, support_fg_mask, save_path=path, score=scores[0])
                 
-            pbar.set_postfix_str({
+            postfix = {
                 "positive_mdice": f"{_safe_mean(mean_dice):.4f}",
                 "positive_miou": f"{_safe_mean(mean_iou):.4f}, n_try: {n_try}",
-            })
+            }
+            if is_polyp_ds and uses_dino_support_pool(support_selection) and qspa_info is not None:
+                ranked0 = qspa_info["ranked"][0]
+                postfix["supp"] = f"{ranked0[0]}:{ranked0[1]:.3f}x{len(qspa_info['ranked'])}"
+            pbar.set_postfix_str(postfix)
                 
+
+    if is_polyp_ds and polyp_match_support and polyp_support_skipped:
+        _log.info(
+            f'Polyp matched-support skipped {polyp_support_skipped} queries '
+            f'(no train pool; policy={polyp_unmatched_policy})'
+        )
 
     for k in mean_dice_cases.keys():
         _run.log_scalar(f'mar_val_batches_meanDice_{k}', np.mean(mean_dice_cases[k]))

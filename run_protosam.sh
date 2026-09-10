@@ -51,6 +51,9 @@ ALL_SCALE=( "MIDDLE") # config of pseudolabels
 if [ $MODALITY == "polyp" ]
 then
     ORGAN="spleen"
+    SUPPORT_SELECT_MODE="${SUPPORT_SELECT_MODE:-dino_sim}"
+else
+    SUPPORT_SELECT_MODE="${SUPPORT_SELECT_MODE:-random}"
 fi
 
 FREE_DESC=""
@@ -68,6 +71,11 @@ fi
 if [ $DO_CCA = "True" ]
 then
     CPT="${CPT}_cca"
+fi
+
+if [ "$SUPPORT_SELECT_MODE" != "random" ]
+then
+    CPT="${CPT}_${SUPPORT_SELECT_MODE}"
 fi
 
 CPT="${CPT}_grid_${PROTO_GRID}_res_${INPUT_SIZE}_${ORGAN}_fold"
@@ -120,6 +128,7 @@ do
             support_idx=$SUPP_ID \
             lora=$LORA \
             do_cca=$DO_CCA \
+            "support_select_mode=$SUPPORT_SELECT_MODE" \
             "input_size=($INPUT_SIZE, $INPUT_SIZE)"
     done
 done

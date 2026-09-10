@@ -286,6 +286,29 @@ class PolypDataset(data.Dataset):
                 
         return n_support_images, n_support_labels
 
+    def get_support_pool_paths(self, text_file=None):
+        """All candidate support (image, mask) paths. No random sampling."""
+        if text_file is not None:
+            paths = []
+            with open(text_file, 'r') as file:
+                for line in file:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    image_path, mask_path = line.split()
+                    paths.append((image_path, mask_path))
+            if not paths:
+                raise ValueError(f"empty support text file: {text_file}")
+            return paths
+        return list(zip(self.images, self.gts))
+
+    def load_support_item(self, image_path, gt_path):
+        """Load and preprocess one support image-mask pair."""
+        support_img = self.cv2_loader(image_path, is_mask=False)
+        support_mask = self.cv2_loader(gt_path, is_mask=True)
+        out = self.process_image_gt(support_img, support_mask)
+        return out['image'].unsqueeze(0), out['label'].unsqueeze(0), out['case']
+
     def get_support(self, n_support=1, support_image_dir=None, support_mask_dir=None, text_file=None):
         """
         Get support set from specified directories, text file or from the dataset itself

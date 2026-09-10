@@ -118,6 +118,16 @@ elif [ "$AUDIT_CONTROL" == "True" ]; then
     CPT="${CPT}_candidate_audit_control"
 fi
 
+# Polyp: DINO cosine-sim 1-shot (PAPSP). Override with SUPPORT_SELECT_MODE=random.
+if [ "$MODALITY" == "polyp" ]; then
+    SUPPORT_SELECT_MODE="${SUPPORT_SELECT_MODE:-dino_sim}"
+else
+    SUPPORT_SELECT_MODE="${SUPPORT_SELECT_MODE:-random}"
+fi
+if [ "$SUPPORT_SELECT_MODE" != "random" ]; then
+    CPT="${CPT}_${SUPPORT_SELECT_MODE}"
+fi
+
 CPT="${CPT}_fold"
 SUPP_ID='[4]'
 
@@ -221,6 +231,7 @@ do
             support_idx=$SUPP_ID \
             lora=$LORA \
             do_cca=$DO_CCA \
+            "support_select_mode=$SUPPORT_SELECT_MODE" \
             "input_size=($INPUT_SIZE, $INPUT_SIZE)" \
             "$ABLATION_ARG" \
             "${PRESENCE_ARGS[@]}" \

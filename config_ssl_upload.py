@@ -105,6 +105,13 @@ def cfg():
     point_mode="both" # for ProtoSAM, choose: both, conf, centroid
     use_neg_points=False
     n_support=1 # num support images
+    support_select_mode="random" # random | dino_sim (legacy; dino_sim maps to support_selection=top1)
+    support_selection="random" # random | top1 | topk_weighted (QSPA)
+    top_k=5 # used when support_selection=topk_weighted
+    prototype_temperature=0.07 # softmax temperature over top-K DINOv2 cosine sims
+    polyp_match_support_to_query=False # True: support only from query's Polyp sub-dataset train pool
+    polyp_unmatched_support_policy="skip" # skip | fallback_all | error when train pool missing (Colon/ETIS)
+    polyp_eval_datasets=None # None=all; e.g. ['CVC-ColonDB'] to eval a subset
     protosam_sam_ver="sam_h" # or medsam
     grad_accumulation_steps=1
     ttt=False

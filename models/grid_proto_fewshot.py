@@ -109,6 +109,16 @@ class FewShotSeg(nn.Module):
         
         return img_fts
 
+    def get_image_embedding(self, imgs):
+        """Image-level embedding from the existing DINO/encoder feature map.
+
+        Uses get_features() then global-average-pools patch tokens and L2-normalizes,
+        so cosine similarity is a dot product. imgs: [B, 3, H, W] -> [B, C].
+        """
+        img_fts = self.get_features(imgs)
+        emb = img_fts.mean(dim=(-2, -1))
+        return F.normalize(emb, p=2, dim=1, eps=1e-4)
+
     # 该函数基于预设的网格大小和特征维度 embed_dim，实例化用于计算相似度的原型分类器单元 cls_unit
     def get_cls(self):
         """
@@ -218,7 +228,57 @@ class FewShotSeg(nn.Module):
         return supp_imgs, fore_mask, back_mask, qry_imgs
 
     #该函数执行模型的核心前向传播，处理支持集和查询集数据以生成原型并计算相似度，最终输出分割预测结果张量及对齐损失
-    def forward(self, supp_imgs, fore_mask, back_mask, qry_imgs, isval, val_wsize, show_viz=False, supp_fts=None):
+    def _cls_scores_for_shot(self, qry_fts, supp_ft, fg_msk, bg_msk, isval, val_wsize, vis_sim=False, full_res_mask=None, background_score=None):
+        """Run existing ALPNet prototype matching on one support (fg/bg kept separate)."""
+        bg_mode = BG_PROT_MODE
+        raw_bg, _, aux_bg, _ = self.cls_unit(
+            qry_fts, supp_ft, bg_msk, mode=bg_mode, thresh=BG_THRESH,
+            isval=isval, val_wsize=val_wsize, vis_sim=vis_sim)
+        if self.config["cls_name"] == 'grid_proto_3d':
+            k_size = self.cls_unit.kernel_size
+            fg_mode = FG_PROT_MODE if F.avg_pool3d(fg_msk, k_size).max(
+            ) >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask'
+        else:
+            k_size = self.cls_unit.kernel_size
+            _handles_own_fg = self.config.get('cls_name', '').startswith(('spen', 'dense_fg_'))
+            if _handles_own_fg:
+                fg_mode = 'mask'
+            else:
+                fg_pool = fg_msk.reshape(-1, 1, fg_msk.shape[-2], fg_msk.shape[-1])
+                fg_mode = FG_PROT_MODE if F.avg_pool2d(fg_pool, k_size).max(
+                ) >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask'
+        raw_fg, _, aux_fg, proto_grid = self.cls_unit(
+            qry_fts, supp_ft, fg_msk, mode=fg_mode,
+            thresh=FG_THRESH, isval=isval, val_wsize=val_wsize,
+            vis_sim=vis_sim,
+            full_res_mask=full_res_mask,
+            background_score=(
+                background_score if self.config.get('cls_name', '').startswith('dense_fg_')
+                else None
+            ),
+        )
+        return raw_bg, raw_fg, aux_fg, proto_grid
+
+    def _weighted_score_fusion(self, per_shot_scores, support_weights):
+        """QSPA Scheme A: fuse per-support similarity maps with softmax weights.
+
+        Do not add local prototypes across supports; they have no correspondence.
+        """
+        stacked = torch.stack(per_shot_scores, dim=0)
+        weights = support_weights
+        if not torch.is_tensor(weights):
+            weights = torch.as_tensor(weights, device=stacked.device, dtype=stacked.dtype)
+        else:
+            weights = weights.to(device=stacked.device, dtype=stacked.dtype)
+        weights = weights.view(-1)
+        if weights.numel() != stacked.shape[0]:
+            raise ValueError(
+                f"QSPA support_weights length {weights.numel()} != n_shots {stacked.shape[0]}")
+        view = [weights.shape[0]] + [1] * (stacked.dim() - 1)
+        return (stacked * weights.view(*view)).sum(dim=0)
+
+    #该函数执行模型的核心前向传播，处理支持集和查询集数据以生成原型并计算相似度，最终输出分割预测结果张量及对齐损失
+    def forward(self, supp_imgs, fore_mask, back_mask, qry_imgs, isval, val_wsize, show_viz=False, supp_fts=None, support_weights=None):
         """
         Args:
             supp_imgs: support images
@@ -337,185 +397,214 @@ class FewShotSeg(nn.Module):
             fg_sim_maps = []
             bg_mode = BG_PROT_MODE
 
-            '''
-            步骤 6：背景相似度计算。 将查询特征、支持特征与降采样后的背景掩码输入分类器单元 cls_unit，
-            基于背景原型模式 BG_PROT_MODE 计算并保存背景像素的相似度得分 _raw_score 及分配图。
-            '''
-            _raw_score, _, aux_attr, _ = self.cls_unit(
-                qry_fts, supp_fts, res_bg_msk, mode=bg_mode, thresh=BG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=debug_enabled)
-            scores.append(_raw_score)
-            assign_maps.append(aux_attr['proto_assign'])
-            if debug_enabled:
-                debug_viz.save_heatmap(_raw_score[0, 0], os.path.join(debug_dir, 'alpnet_04_raw_score_bg_heatmap.png'), target_size=img_size, image=qry_imgs[0][epi])
-            
-            for way, _msks in enumerate(res_fg_msk):
-                raw_scores = []
-                for i, _msk in enumerate(_msks):
-                    _msk = _msk.unsqueeze(0)
+            use_qspa = support_weights is not None and n_shots >= 1
+            if use_qspa:
+                # QSPA Scheme A: each support builds its own fg/bg prototypes and
+                # similarity maps; fuse maps with query-conditioned softmax weights.
+                # Local prototypes are never added across supports.
+                bg_maps, fg_maps = [], []
+                aux_attr = None
+                proto_grid = None
+                for i in range(n_shots):
                     supp_ft = supp_fts[:, i].unsqueeze(0)
-                    if self.config["cls_name"] == 'grid_proto_3d':  # 3D
-                        k_size = self.cls_unit.kernel_size
-                        fg_mode = FG_PROT_MODE if F.avg_pool3d(_msk, k_size).max(
-                        ) >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask'  # TODO figure out kernel size
-                    else:
-                        k_size = self.cls_unit.kernel_size
-                        _handles_own_fg = self.config.get('cls_name', '').startswith(('spen', 'dense_fg_'))
-                        if _handles_own_fg:
-                            fg_mode = 'mask'  # matcher handles its own foreground representation
-                        else:
-                            fg_mode = FG_PROT_MODE if F.avg_pool2d(_msk, k_size).max(
-                            ) >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask'
-                            # TODO figure out kernel size
-                    _raw_score, _, aux_attr, proto_grid = self.cls_unit(
-                        qry_fts, supp_ft, _msk.unsqueeze(0), mode=fg_mode,
-                        thresh=FG_THRESH, isval=isval, val_wsize=val_wsize,
+                    fg_msk = res_fg_msk[:, i:i + 1]
+                    bg_msk = res_bg_msk[:, i:i + 1]
+                    raw_bg, raw_fg, aux_attr, proto_grid = self._cls_scores_for_shot(
+                        qry_fts, supp_ft, fg_msk, bg_msk, isval, val_wsize,
                         vis_sim=debug_enabled,
-                        full_res_mask=fore_mask[way, i, epi],
-                        background_score=(
-                            scores[0]
-                            if self.config.get('cls_name', '').startswith('dense_fg_')
-                            else None
-                        ),
+                        full_res_mask=fore_mask[0, i, epi],
                     )
-                    raw_scores.append(_raw_score)
+                    bg_maps.append(raw_bg)
+                    fg_maps.append(raw_fg)
+                _raw_score_bg = self._weighted_score_fusion(bg_maps, support_weights)
+                _raw_score = self._weighted_score_fusion(fg_maps, support_weights)
+                scores.append(_raw_score_bg)
+                scores.append(_raw_score)
+                assign_maps.append(aux_attr['proto_assign'])
+                assign_maps.append(aux_attr['proto_assign'])
+                if debug_enabled:
+                    debug_viz.save_heatmap(_raw_score_bg[0, 0], os.path.join(debug_dir, 'alpnet_04_raw_score_bg_heatmap.png'), target_size=img_size, image=qry_imgs[0][epi])
+                    debug_viz.save_heatmap(_raw_score[0, 0], os.path.join(debug_dir, 'alpnet_04_raw_score_fg_heatmap.png'), target_size=img_size, image=qry_imgs[0][epi])
+            else:
                 '''
-                步骤 7：前景相似度计算与原型模式动态选择。 遍历每个前景掩码，利用平均池化激活值判断当前目标的范围大小，
-                动态决定使用网格原型（gridconv+）还是全局掩码原型（mask）；随后输入分类器计算前景得分，并在多 Shot 维度取最大值得分
+                步骤 6：背景相似度计算。 将查询特征、支持特征与降采样后的背景掩码输入分类器单元 cls_unit，
+                基于背景原型模式 BG_PROT_MODE 计算并保存背景像素的相似度得分 _raw_score 及分配图。
                 '''
-                # create a score where each feature is the max of the raw_score
-                _raw_score = torch.stack(raw_scores, dim=1).max(dim=1)[
-                    0] 
+                _raw_score, _, aux_attr, _ = self.cls_unit(
+                    qry_fts, supp_fts, res_bg_msk, mode=bg_mode, thresh=BG_THRESH, isval=isval, val_wsize=val_wsize, vis_sim=debug_enabled)
                 scores.append(_raw_score)
                 assign_maps.append(aux_attr['proto_assign'])
                 if debug_enabled:
-                    if proto_grid is not None:
-                        debug_viz.save_assign_overlay(proto_grid, supp_fts[0, 0, epi], os.path.join(debug_dir, 'alpnet_03_proto_grid_overlay.png'), target_size=img_size)
-                    elif aux_attr.get('proto_assign') is not None:
-                        debug_viz.save_assign_overlay(aux_attr['proto_assign'], qry_fts[0, epi], os.path.join(debug_dir, 'alpnet_03_assign_maps_overlay.png'), target_size=img_size)
-                    debug_viz.save_heatmap(_raw_score[0, 0], os.path.join(debug_dir, 'alpnet_04_raw_score_fg_heatmap.png'), target_size=img_size, image=qry_imgs[0][epi])
-                    score_margin = _raw_score[0, 0] - scores[0][0, 0]
-                    debug_viz.save_heatmap(score_margin, os.path.join(debug_dir, 'alpnet_05_fg_minus_bg_margin.png'), target_size=img_size, image=qry_imgs[0][epi])
-                    if self.config.get('cls_name', '').startswith('dense_fg_'):
-                        occupancy = aux_attr.get('dense_occupancy')
-                        dense_similarity = aux_attr.get('dense_similarity')
-                        global_similarity = aux_attr.get('global_similarity')
-                        print(
-                            'Dense foreground evidence:',
-                            f"mode={self.config.get('cls_name')}",
-                            f"effective_mass={aux_attr.get('dense_effective_token_count')}",
-                            f"nonzero_tokens={aux_attr.get('dense_nonzero_token_count')}",
-                            f"hard_fallback={aux_attr.get('dense_hard_fallback')}",
-                            f"temperature={aux_attr.get('dense_temperature')}",
-                            f"aggregation={aux_attr.get('dense_aggregation')}",
-                            f"uses_null={aux_attr.get('dense_uses_background_null')}",
-                            f"null_strength={aux_attr.get('dense_null_strength')}",
+                    debug_viz.save_heatmap(_raw_score[0, 0], os.path.join(debug_dir, 'alpnet_04_raw_score_bg_heatmap.png'), target_size=img_size, image=qry_imgs[0][epi])
+            
+                for way, _msks in enumerate(res_fg_msk):
+                    raw_scores = []
+                    for i, _msk in enumerate(_msks):
+                        _msk = _msk.unsqueeze(0)
+                        supp_ft = supp_fts[:, i].unsqueeze(0)
+                        if self.config["cls_name"] == 'grid_proto_3d':  # 3D
+                            k_size = self.cls_unit.kernel_size
+                            fg_mode = FG_PROT_MODE if F.avg_pool3d(_msk, k_size).max(
+                            ) >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask'  # TODO figure out kernel size
+                        else:
+                            k_size = self.cls_unit.kernel_size
+                            _handles_own_fg = self.config.get('cls_name', '').startswith(('spen', 'dense_fg_'))
+                            if _handles_own_fg:
+                                fg_mode = 'mask'  # matcher handles its own foreground representation
+                            else:
+                                fg_mode = FG_PROT_MODE if F.avg_pool2d(_msk, k_size).max(
+                                ) >= FG_THRESH and FG_PROT_MODE != 'mask' else 'mask'
+                                # TODO figure out kernel size
+                        _raw_score, _, aux_attr, proto_grid = self.cls_unit(
+                            qry_fts, supp_ft, _msk.unsqueeze(0), mode=fg_mode,
+                            thresh=FG_THRESH, isval=isval, val_wsize=val_wsize,
+                            vis_sim=debug_enabled,
+                            full_res_mask=fore_mask[way, i, epi],
+                            background_score=(
+                                scores[0]
+                                if self.config.get('cls_name', '').startswith('dense_fg_')
+                                else None
+                            ),
                         )
-                        if occupancy is not None:
-                            debug_viz.save_mask_overlay(
-                                supp_imgs[0][0][epi], occupancy[0, 0],
-                                os.path.join(debug_dir, 'dense_01_support_occupancy_overlay.png'),
-                                color_bgr=(0, 165, 255), alpha=0.55,
+                        raw_scores.append(_raw_score)
+                    '''
+                    步骤 7：前景相似度计算与原型模式动态选择。 遍历每个前景掩码，利用平均池化激活值判断当前目标的范围大小，
+                    动态决定使用网格原型（gridconv+）还是全局掩码原型（mask）；随后输入分类器计算前景得分，并在多 Shot 维度取最大值得分
+                    '''
+                    # create a score where each feature is the max of the raw_score
+                    _raw_score = torch.stack(raw_scores, dim=1).max(dim=1)[
+                        0] 
+                    scores.append(_raw_score)
+                    assign_maps.append(aux_attr['proto_assign'])
+                    if debug_enabled:
+                        if proto_grid is not None:
+                            debug_viz.save_assign_overlay(proto_grid, supp_fts[0, 0, epi], os.path.join(debug_dir, 'alpnet_03_proto_grid_overlay.png'), target_size=img_size)
+                        elif aux_attr.get('proto_assign') is not None:
+                            debug_viz.save_assign_overlay(aux_attr['proto_assign'], qry_fts[0, epi], os.path.join(debug_dir, 'alpnet_03_assign_maps_overlay.png'), target_size=img_size)
+                        debug_viz.save_heatmap(_raw_score[0, 0], os.path.join(debug_dir, 'alpnet_04_raw_score_fg_heatmap.png'), target_size=img_size, image=qry_imgs[0][epi])
+                        score_margin = _raw_score[0, 0] - scores[0][0, 0]
+                        debug_viz.save_heatmap(score_margin, os.path.join(debug_dir, 'alpnet_05_fg_minus_bg_margin.png'), target_size=img_size, image=qry_imgs[0][epi])
+                        if self.config.get('cls_name', '').startswith('dense_fg_'):
+                            occupancy = aux_attr.get('dense_occupancy')
+                            dense_similarity = aux_attr.get('dense_similarity')
+                            global_similarity = aux_attr.get('global_similarity')
+                            print(
+                                'Dense foreground evidence:',
+                                f"mode={self.config.get('cls_name')}",
+                                f"effective_mass={aux_attr.get('dense_effective_token_count')}",
+                                f"nonzero_tokens={aux_attr.get('dense_nonzero_token_count')}",
+                                f"hard_fallback={aux_attr.get('dense_hard_fallback')}",
+                                f"temperature={aux_attr.get('dense_temperature')}",
+                                f"aggregation={aux_attr.get('dense_aggregation')}",
+                                f"uses_null={aux_attr.get('dense_uses_background_null')}",
+                                f"null_strength={aux_attr.get('dense_null_strength')}",
                             )
-                        if dense_similarity is not None:
-                            debug_viz.save_heatmap(
-                                dense_similarity[0, 0],
-                                os.path.join(debug_dir, 'dense_02_lse_evidence_heatmap.png'),
-                                target_size=img_size, image=qry_imgs[0][epi],
+                            if occupancy is not None:
+                                debug_viz.save_mask_overlay(
+                                    supp_imgs[0][0][epi], occupancy[0, 0],
+                                    os.path.join(debug_dir, 'dense_01_support_occupancy_overlay.png'),
+                                    color_bgr=(0, 165, 255), alpha=0.55,
+                                )
+                            if dense_similarity is not None:
+                                debug_viz.save_heatmap(
+                                    dense_similarity[0, 0],
+                                    os.path.join(debug_dir, 'dense_02_lse_evidence_heatmap.png'),
+                                    target_size=img_size, image=qry_imgs[0][epi],
+                                )
+                            if global_similarity is not None:
+                                debug_viz.save_heatmap(
+                                    global_similarity[0, 0],
+                                    os.path.join(debug_dir, 'dense_03_global_anchor_heatmap.png'),
+                                    target_size=img_size, image=qry_imgs[0][epi],
+                                )
+                            foreground_match_probability = aux_attr.get(
+                                'dense_foreground_match_probability'
                             )
-                        if global_similarity is not None:
-                            debug_viz.save_heatmap(
-                                global_similarity[0, 0],
-                                os.path.join(debug_dir, 'dense_03_global_anchor_heatmap.png'),
-                                target_size=img_size, image=qry_imgs[0][epi],
-                            )
-                        foreground_match_probability = aux_attr.get(
-                            'dense_foreground_match_probability'
-                        )
-                        if foreground_match_probability is not None:
-                            debug_viz.save_heatmap(
-                                foreground_match_probability[0, 0],
-                                os.path.join(debug_dir, 'dense_04_null_match_probability.png'),
-                                target_size=img_size, image=qry_imgs[0][epi],
-                            )
-                        null_penalty = aux_attr.get('dense_null_penalty')
-                        if null_penalty is not None:
-                            debug_viz.save_heatmap(
-                                null_penalty[0, 0],
-                                os.path.join(debug_dir, 'dense_05_null_penalty.png'),
-                                target_size=img_size, image=qry_imgs[0][epi],
-                            )
-                        attention_entropy = aux_attr.get('dense_attention_entropy')
-                        if attention_entropy is not None:
-                            debug_viz.save_heatmap(
-                                attention_entropy[0, 0],
-                                os.path.join(debug_dir, 'dense_06_attention_entropy.png'),
-                                target_size=img_size, image=qry_imgs[0][epi],
-                            )
-                        dense_debug = {
-                            key: value.detach().cpu() if torch.is_tensor(value) else value
-                            for key, value in aux_attr.items()
-                            if key.startswith('dense_') or key == 'global_similarity'
-                        }
-                        dense_debug.update({
-                            'raw_score_bg': scores[0].detach().cpu(),
-                            'raw_score_fg': _raw_score.detach().cpu(),
-                            'fg_minus_bg_margin': score_margin.detach().cpu(),
-                        })
-                        torch.save(dense_debug, os.path.join(debug_dir, 'dense_debug_tensors.pt'))
-                    if self.config.get('cls_name', '').startswith('spen'):
-                        print(
-                            'SPEN prototype counts:',
-                            f"support_pixels={aux_attr.get('spen_n_fg')}",
-                            f"support_k={aux_attr.get('spen_k')}",
-                            f"support_area_k={aux_attr.get('spen_area_k')}",
-                            f"support_feature_cells={aux_attr.get('spen_effective_feature_cells')}",
-                            f"effective_Cs={aux_attr.get('spen_effective_cs')}",
-                            f"query_pixels={aux_attr.get('qry_n_fg')}",
-                            f"query_k={aux_attr.get('qry_k')}",
-                            f"query_area_k={aux_attr.get('qry_area_k')}",
-                            f"query_feature_cells={aux_attr.get('qry_effective_feature_cells')}",
-                        )
-                        if aux_attr.get('spen_fg_hw') is not None:
-                            debug_viz.save_points_overlay(supp_imgs[0][0][epi], aux_attr.get('spen_fg_hw'), aux_attr.get('spen_center_idx'), aux_attr.get('spen_feature_hw', fts_size), os.path.join(debug_dir, 'spen_01_centers_overlay.png'))
-                        if aux_attr.get('qry_coarse_mask') is not None:
-                            debug_viz.save_mask_overlay(qry_imgs[0][epi], aux_attr['qry_coarse_mask'], os.path.join(debug_dir, 'spen_02_qry_coarse_mask_overlay.png'), color_bgr=(0, 255, 255), alpha=0.5)
-                        if aux_attr.get('weights') is not None:
-                            print('SPEN OT weights:', aux_attr['weights'].detach().cpu().numpy())
-                            if aux_attr.get('transport_plan') is not None:
-                                print('SPEN transport plan:', aux_attr['transport_plan'].detach().cpu().numpy())
-                            debug_viz.save_bar(aux_attr['weights'], os.path.join(debug_dir, 'spen_03_weights_bar.png'))
-                            debug_viz.save_bar(aux_attr['weights_relative'], os.path.join(debug_dir, 'spen_03_weights_relative_bar.png'))
-                        if aux_attr.get('multi_proto_priors') is not None:
-                            print('SPEN multi-prototype priors:', aux_attr['multi_proto_priors'].detach().cpu().numpy())
-                            debug_viz.save_bar(
-                                aux_attr['multi_proto_priors'],
-                                os.path.join(debug_dir, 'spen_03_multi_proto_priors_bar.png')
-                            )
-                        if aux_attr.get('sim') is not None:
-                            debug_viz.save_heatmap(aux_attr['sim'][0, 0], os.path.join(debug_dir, 'spen_04_final_sim_heatmap.png'), target_size=img_size, image=qry_imgs[0][epi])
-                        tensor_debug = {
-                            key: value.detach().cpu() if torch.is_tensor(value) else value
-                            for key, value in aux_attr.items()
-                            if key in {
-                                'weights', 'weights_relative', 'prototype_similarity', 'transport_plan',
-                                'transport_row_sum', 'transport_col_sum',
-                                'multi_proto_priors',
-                                'spen_n_fg', 'spen_k', 'qry_n_fg', 'qry_k',
-                                'spen_area_k', 'spen_effective_cs',
-                                'spen_effective_feature_cells', 'qry_area_k',
-                                'qry_effective_cs', 'qry_effective_feature_cells',
-                                'qry_bootstrap_sim', 'qry_coarse_mask'
+                            if foreground_match_probability is not None:
+                                debug_viz.save_heatmap(
+                                    foreground_match_probability[0, 0],
+                                    os.path.join(debug_dir, 'dense_04_null_match_probability.png'),
+                                    target_size=img_size, image=qry_imgs[0][epi],
+                                )
+                            null_penalty = aux_attr.get('dense_null_penalty')
+                            if null_penalty is not None:
+                                debug_viz.save_heatmap(
+                                    null_penalty[0, 0],
+                                    os.path.join(debug_dir, 'dense_05_null_penalty.png'),
+                                    target_size=img_size, image=qry_imgs[0][epi],
+                                )
+                            attention_entropy = aux_attr.get('dense_attention_entropy')
+                            if attention_entropy is not None:
+                                debug_viz.save_heatmap(
+                                    attention_entropy[0, 0],
+                                    os.path.join(debug_dir, 'dense_06_attention_entropy.png'),
+                                    target_size=img_size, image=qry_imgs[0][epi],
+                                )
+                            dense_debug = {
+                                key: value.detach().cpu() if torch.is_tensor(value) else value
+                                for key, value in aux_attr.items()
+                                if key.startswith('dense_') or key == 'global_similarity'
                             }
-                        }
-                        tensor_debug.update({
-                            'raw_score_bg': scores[0].detach().cpu(),
-                            'raw_score_fg': _raw_score.detach().cpu(),
-                            'fg_minus_bg_margin': score_margin.detach().cpu(),
-                        })
-                        torch.save(tensor_debug, os.path.join(debug_dir, 'spen_debug_tensors.pt'))
-                if show_viz:
-                    fg_sim_maps.append(aux_attr['raw_local_sims'])
-            # print(f"Time for fg: {time.time() - start_time}")
+                            dense_debug.update({
+                                'raw_score_bg': scores[0].detach().cpu(),
+                                'raw_score_fg': _raw_score.detach().cpu(),
+                                'fg_minus_bg_margin': score_margin.detach().cpu(),
+                            })
+                            torch.save(dense_debug, os.path.join(debug_dir, 'dense_debug_tensors.pt'))
+                        if self.config.get('cls_name', '').startswith('spen'):
+                            print(
+                                'SPEN prototype counts:',
+                                f"support_pixels={aux_attr.get('spen_n_fg')}",
+                                f"support_k={aux_attr.get('spen_k')}",
+                                f"support_area_k={aux_attr.get('spen_area_k')}",
+                                f"support_feature_cells={aux_attr.get('spen_effective_feature_cells')}",
+                                f"effective_Cs={aux_attr.get('spen_effective_cs')}",
+                                f"query_pixels={aux_attr.get('qry_n_fg')}",
+                                f"query_k={aux_attr.get('qry_k')}",
+                                f"query_area_k={aux_attr.get('qry_area_k')}",
+                                f"query_feature_cells={aux_attr.get('qry_effective_feature_cells')}",
+                            )
+                            if aux_attr.get('spen_fg_hw') is not None:
+                                debug_viz.save_points_overlay(supp_imgs[0][0][epi], aux_attr.get('spen_fg_hw'), aux_attr.get('spen_center_idx'), aux_attr.get('spen_feature_hw', fts_size), os.path.join(debug_dir, 'spen_01_centers_overlay.png'))
+                            if aux_attr.get('qry_coarse_mask') is not None:
+                                debug_viz.save_mask_overlay(qry_imgs[0][epi], aux_attr['qry_coarse_mask'], os.path.join(debug_dir, 'spen_02_qry_coarse_mask_overlay.png'), color_bgr=(0, 255, 255), alpha=0.5)
+                            if aux_attr.get('weights') is not None:
+                                print('SPEN OT weights:', aux_attr['weights'].detach().cpu().numpy())
+                                if aux_attr.get('transport_plan') is not None:
+                                    print('SPEN transport plan:', aux_attr['transport_plan'].detach().cpu().numpy())
+                                debug_viz.save_bar(aux_attr['weights'], os.path.join(debug_dir, 'spen_03_weights_bar.png'))
+                                debug_viz.save_bar(aux_attr['weights_relative'], os.path.join(debug_dir, 'spen_03_weights_relative_bar.png'))
+                            if aux_attr.get('multi_proto_priors') is not None:
+                                print('SPEN multi-prototype priors:', aux_attr['multi_proto_priors'].detach().cpu().numpy())
+                                debug_viz.save_bar(
+                                    aux_attr['multi_proto_priors'],
+                                    os.path.join(debug_dir, 'spen_03_multi_proto_priors_bar.png')
+                                )
+                            if aux_attr.get('sim') is not None:
+                                debug_viz.save_heatmap(aux_attr['sim'][0, 0], os.path.join(debug_dir, 'spen_04_final_sim_heatmap.png'), target_size=img_size, image=qry_imgs[0][epi])
+                            tensor_debug = {
+                                key: value.detach().cpu() if torch.is_tensor(value) else value
+                                for key, value in aux_attr.items()
+                                if key in {
+                                    'weights', 'weights_relative', 'prototype_similarity', 'transport_plan',
+                                    'transport_row_sum', 'transport_col_sum',
+                                    'multi_proto_priors',
+                                    'spen_n_fg', 'spen_k', 'qry_n_fg', 'qry_k',
+                                    'spen_area_k', 'spen_effective_cs',
+                                    'spen_effective_feature_cells', 'qry_area_k',
+                                    'qry_effective_cs', 'qry_effective_feature_cells',
+                                    'qry_bootstrap_sim', 'qry_coarse_mask'
+                                }
+                            }
+                            tensor_debug.update({
+                                'raw_score_bg': scores[0].detach().cpu(),
+                                'raw_score_fg': _raw_score.detach().cpu(),
+                                'fg_minus_bg_margin': score_margin.detach().cpu(),
+                            })
+                            torch.save(tensor_debug, os.path.join(debug_dir, 'spen_debug_tensors.pt'))
+                    if show_viz:
+                        fg_sim_maps.append(aux_attr['raw_local_sims'])
+                # print(f"Time for fg: {time.time() - start_time}")
             '''
             步骤 8：预测结果上采样。 将背景得分和各类别前景得分在通道维度拼接作为预测张量 pred，使用双线性插值将其放大回原始输入图像的尺寸 
             '''

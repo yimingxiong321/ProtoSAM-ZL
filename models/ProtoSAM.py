@@ -90,7 +90,7 @@ class ModelWrapper(ABC):
         
 #3. ALPNetInput、ALPNetOutput 与 ALPNetWrapper：这些模块专门针对 ALPNet（一个小样本分割模型）把数据打包为模型输入形式
 class ALPNetInput(SegmentationInput): # for alpnet
-    def __init__(self, support_images:list, support_labels:list, query_images:torch.Tensor, isval, val_wsize, show_viz=False, supp_fts=None):
+    def __init__(self, support_images:list, support_labels:list, query_images:torch.Tensor, isval, val_wsize, show_viz=False, supp_fts=None, support_weights=None):
         self.supp_imgs = [support_images]
         self.fore_mask = [support_labels]
         self.back_mask = [[1 - sup_labels for sup_labels in support_labels]]
@@ -99,6 +99,8 @@ class ALPNetInput(SegmentationInput): # for alpnet
         self.val_wsize = val_wsize
         self.show_viz = show_viz
         self.supp_fts = supp_fts
+        # QSPA: softmax weights over top-K supports. None keeps original 1-shot / max-shot path.
+        self.support_weights = support_weights
         
     def set_query_images(self, query_images):
         self.qry_imgs = [query_images]
@@ -110,6 +112,8 @@ class ALPNetInput(SegmentationInput): # for alpnet
         self.qry_imgs = [qry_img.to(device) for qry_img in self.qry_imgs]
         if self.supp_fts is not None:
             self.supp_fts = self.supp_fts.to(device)
+        if self.support_weights is not None and torch.is_tensor(self.support_weights):
+            self.support_weights = self.support_weights.to(device)
 
 class ALPNetOutput(SegmentationOutput):
     def __init__(self, pred, align_loss, sim_maps, assign_maps, proto_grid, supp_fts, qry_fts):
@@ -179,10 +183,10 @@ class SamWrapperWrapper(ModelWrapper):
 #5. 根据（TYPE_ALPNET 或 TYPE_SAM）调用对应的模型输入处理类进行数据处理，返回对应模型可以接受的数据形式（对象）
 class InputFactory(ABC):
     @staticmethod
-    def create_input(input_type, query_image, support_images=None, support_labels=None, isval=False, val_wsize=None, show_viz=False, supp_fts=None, original_sz=None, img_sz=None, gts=None):
+    def create_input(input_type, query_image, support_images=None, support_labels=None, isval=False, val_wsize=None, show_viz=False, supp_fts=None, original_sz=None, img_sz=None, gts=None, support_weights=None):
         
         if input_type == TYPE_ALPNET:
-            return ALPNetInput(support_images, support_labels, query_image, isval, val_wsize, show_viz, supp_fts)
+            return ALPNetInput(support_images, support_labels, query_image, isval, val_wsize, show_viz, supp_fts, support_weights=support_weights)
         elif input_type == TYPE_SAM:
             qimg = np.array(query_image.detach().cpu())
             B,C,H,W = qimg.shape
@@ -235,6 +239,19 @@ class ProtoSAM(nn.Module):
         self.last_presence_scores = None
         self.last_candidate_proposals = None
         self.last_proposal_slices = None
+
+    def eval(self):
+        super().eval()
+        # ALPNetWrapper is not an nn.Module, so nn.Module.eval() does not reach it.
+        if hasattr(self.coarse_segmentation_model, "eval"):
+            self.coarse_segmentation_model.eval()
+        return self
+
+    def train(self, mode=True):
+        super().train(mode)
+        if hasattr(self.coarse_segmentation_model, "train"):
+            self.coarse_segmentation_model.train()
+        return self
 
     def compute_presence_scores(self, foreground_probability):
         """Reuse the coarse wrapper's cached DINOv2 tensors without re-encoding."""
