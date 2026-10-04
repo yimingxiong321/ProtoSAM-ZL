@@ -1,3 +1,4 @@
+import os
 import warnings
 import torch
 import torch.nn as nn
@@ -205,12 +206,13 @@ class InputFactory(ABC):
 class ProtoSAM(nn.Module):
 
     # 作用：初始化 ProtoSAM 模块，绑定传入的粗分割模型，加载 SAM 权重，并设定后续生成 SAM 提示词（点、框、掩码）的各种模式和参数。
-    def __init__(self, image_size, coarse_segmentation_model:ModelWrapper, sam_pretrained_path="pretrained_model/sam_default.pth", num_points_for_sam=1, use_points=True, use_bbox=False, use_mask=False, debug=False, use_cca=False, point_mode=CONF_MODE, use_sam_trans=True, coarse_pred_only=False, alpnet_image_size=None, use_neg_points=False, ablation_mode='none', ablation_fixes=None, candidate_audit=False, candidate_audit_thresholds=(0.3, 0.4, 0.5), ):
+    def __init__(self, image_size, coarse_segmentation_model:ModelWrapper, sam_pretrained_path="pretrained_model/sam_default.pth", num_points_for_sam=1, use_points=True, use_bbox=False, use_mask=False, debug=False, use_cca=False, point_mode=CONF_MODE, use_sam_trans=True, coarse_pred_only=False, alpnet_image_size=None, use_neg_points=False, ablation_mode='none', ablation_fixes=None, candidate_audit=False, candidate_audit_thresholds=(0.3, 0.4, 0.5), sam3_text_prompt="polyp", ):
         super().__init__()
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
         self.image_size = image_size
         self.coarse_segmentation_model = coarse_segmentation_model
+        self.sam3_text_prompt = sam3_text_prompt
         self.get_sam(sam_pretrained_path, use_sam_trans) #use_sam_trans的意思是配置图像变换
         self.num_points_for_sam = num_points_for_sam
         self.use_points = use_points
@@ -275,20 +277,36 @@ class ProtoSAM(nn.Module):
 
     # 作用：根据权重路径加载预训练的 SAM 模型及其专用推理器 (SamPredictor)，并可选择性地配置 SAM 特有的图像缩放与归一化变换 (ResizeLongestSide)。     
     def get_sam(self, checkpoint_path, use_sam_trans):
-        model_type="vit_b" # TODO make generic?
-        if 'vit_h' in checkpoint_path:
-            model_type = "vit_h"
-        self.sam = sam_model_registry[model_type](checkpoint=checkpoint_path).eval()
-        self.predictor = SamPredictor(self.sam)
-        self.sam.requires_grad_(False)
+        from models.sam3_grounding import is_sam3_checkpoint, load_sam3_grounding_runtime
+        from models.sam3_predictor import _SamStub
+
+        self.sam3_runtime = None
+        if is_sam3_checkpoint(checkpoint_path):
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            text_prompt = getattr(self, "sam3_text_prompt", "polyp")
+            self.sam3_runtime = load_sam3_grounding_runtime(
+                checkpoint_path=checkpoint_path,
+                device=device,
+                text_prompt=text_prompt,
+            )
+            self.predictor = None
+            self.sam = _SamStub()
+            self._sam3_backend = True
+        else:
+            self._sam3_backend = False
+            model_type = "vit_b"  # TODO make generic?
+            if "vit_h" in checkpoint_path:
+                model_type = "vit_h"
+            self.sam = sam_model_registry[model_type](checkpoint=checkpoint_path).eval()
+            self.predictor = SamPredictor(self.sam)
+            self.sam.requires_grad_(False)
         if use_sam_trans:
-            # sam_trans = ResizeLongestSide(self.sam.image_encoder.img_size, pixel_mean=[0], pixel_std=[1])
             sam_trans = ResizeLongestSide(self.sam.image_encoder.img_size)
             sam_trans.pixel_mean = torch.tensor([0, 0, 0]).view(3, 1, 1)
             sam_trans.pixel_std = torch.tensor([1, 1, 1]).view(3, 1, 1)
         else:
             sam_trans = None
-            
+
         self.sam_trans = sam_trans
 
     # 作用：接收二维的二值化预测图 (pred)，计算并返回一个能够包围图中所有前景像素的全局边界框的四个角点坐标。    
@@ -630,6 +648,38 @@ class ProtoSAM(nn.Module):
         
         return masks, scores
 
+    def predict_w_bbox_sam3(
+        self,
+        bboxes,
+        pil_rgb,
+        prompt_hw,
+        orig_hw,
+        sam_input_points=None,
+        return_logits=False,
+    ):
+        """SAM3 T+I refinement: text + coarse bbox + optional Conf/Cent points (same as SAM1)."""
+        from models.sam3_grounding import predict_grounding_masks_for_boxes
+
+        if self.sam3_runtime is None:
+            raise RuntimeError("sam3_runtime is not loaded")
+        points_seq = None
+        _sam3_pts = os.environ.get("SAM3_USE_COARSE_POINTS", "1").lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        if _sam3_pts and self.use_points and sam_input_points is not None:
+            points_seq = [np.asarray(p) if p is not None else None for p in sam_input_points]
+        return predict_grounding_masks_for_boxes(
+            self.sam3_runtime,
+            pil_rgb,
+            bboxes,
+            tuple(prompt_hw),
+            tuple(orig_hw),
+            points_prompt_space=points_seq,
+            return_logits=return_logits,
+        )
+
     # 作用：将正负样本点和/或边界框作为组合提示词喂入 SAM 预测器，针对输入图像 (qry_img) 推理出精修后的分割掩码与对应得分。
     def predict_w_points_bbox(self, sam_input_points, bboxes, sam_neg_input_points, qry_img, pred, return_logits=False, sam_mask_input=None):
         masks, scores = [], []
@@ -829,6 +879,12 @@ pred = output_logits.argmax(dim=1)[0]
                 return output_logits, [conf]
             return pred, [conf]
 
+        _sam3_pil = None
+        if getattr(self, "_sam3_backend", False):
+            from models.sam3_grounding import query_chw_tensor_to_pil
+
+            _sam3_pil = query_chw_tensor_to_pil(query_image[0])
+
         # 如果查询图像尺寸不等于模型设定的 `self.image_size`，
         # 就把图像和粗分割 logits 值到统一尺寸(保证后续 SAM 处理时尺寸一致）
         # 通常固定需要例如 1024*1024 或 256*256 的尺寸，由 self.image_size 定义
@@ -879,7 +935,24 @@ pred = output_logits.argmax(dim=1)[0]
             else:
                 _qry = _qry.permute(1, 2, 0).detach().cpu().numpy()
             _qry = ((_qry - _qry.min()) / (_qry.max() - _qry.min()) * 255).astype(np.uint8)
-            _masks, _scores = self.predict_w_points_bbox(_sam_pts, _bboxes, _sam_neg_pts, _qry, pred, return_logits=True if self.training else False)
+            if getattr(self, "_sam3_backend", False):
+                from models.sam3_grounding import predict_grounding_mask, query_chw_tensor_to_pil
+
+                _pil = _sam3_pil if _sam3_pil is not None else query_chw_tensor_to_pil(query_image[0])
+                _gt_o = gt_mask.cpu().numpy().astype(np.uint8)
+                _ys, _xs = np.where(_gt_o > 0)
+                _box_o = [int(_xs.min()), int(_ys.min()), int(_xs.max()), int(_ys.max())]
+                _mask, _sc = predict_grounding_mask(self.sam3_runtime, _pil, _box_o)
+                if self.training:
+                    _masks = [np.where(_mask, 1.0, -1.0).astype(np.float32)]
+                else:
+                    _masks = [_mask.astype(np.float32)]
+                _scores = [_sc]
+            else:
+                _masks, _scores = self.predict_w_points_bbox(
+                    _sam_pts, _bboxes, _sam_neg_pts, _qry, pred,
+                    return_logits=True if self.training else False,
+                )
             _pred_out = sum(_masks)
             if not self.training:
                 _pred_out = _pred_out > 0
@@ -1016,33 +1089,55 @@ pred = output_logits.argmax(dim=1)[0]
             # convert points to a list where each item is a list of 2 elements in xy format
             self.plot_most_conf_points(sam_input_points, None, _pred, query_image[0, 0].detach().cpu(), bboxes=bboxes, title=title) # TODO add plots for all points not just the first set of points
 
-        # 步骤 8：SAM 图像预处理与挂载
-        # 将原始查询图像进行格式转换（如使用 sam_trans）并标准化为 0-255 的 uint8 数组，这是 SAM 模型预测器所要求的标准图像输入格式。
-        # self.sam_trans = None
-        if self.sam_trans is None:
-            query_image = query_image.permute(1, 2, 0).detach().cpu().numpy() 
+        # 步骤 8–9：SAM / SAM3 精修
+        if getattr(self, "_sam3_backend", False):
+            if self.use_mask:
+                raise NotImplementedError(
+                    "SAM3 grounding backend supports text+bbox (T+I) only; disable use_mask or use SAM1."
+                )
+            masks, scores = [], []
+            if self.use_points or self.use_bbox:
+                if not self.use_bbox:
+                    raise NotImplementedError(
+                        "SAM3 grounding requires coarse bounding boxes (use_bbox=True)."
+                    )
+                masks, scores = self.predict_w_bbox_sam3(
+                    bboxes,
+                    _sam3_pil,
+                    self.image_size,
+                    original_size,
+                    sam_input_points=sam_input_points,
+                    return_logits=bool(self.training),
+                )
         else:
-            query_image = self.sam_trans.apply_image_torch(query_image[0])
-            query_image = self.sam_trans.preprocess(query_image)
-            query_image = query_image.permute(1, 2, 0).detach().cpu().numpy()
-            # mask = self.sam_trans.preprocess(mask) 
-        
-        
-        query_image = (
-            (query_image - query_image.min())
-            / (query_image.max() - query_image.min() + 1e-8)
-            * 255
-        ).astype(np.uint8)
+            # SAM1：图像预处理为 uint8，再送入 SamPredictor
+            if self.sam_trans is None:
+                query_image = query_image.permute(1, 2, 0).detach().cpu().numpy()
+            else:
+                query_image = self.sam_trans.apply_image_torch(query_image[0])
+                query_image = self.sam_trans.preprocess(query_image)
+                query_image = query_image.permute(1, 2, 0).detach().cpu().numpy()
 
+            query_image = (
+                (query_image - query_image.min())
+                / (query_image.max() - query_image.min() + 1e-8)
+                * 255
+            ).astype(np.uint8)
 
-        # 步骤 9：SAM 大模型精细化推理
-        # 将上述提取到的点、框或掩码提示词连同处理好的图像一起送入 SAM 预测器 (Predictor)，执行具体的零样本/少样本精准分割推理。
-        if self.use_mask:
-            masks, scores = self.predict_w_masks(sam_input_masks, query_image, original_size)
-        
-        start_time = time.time()
-        if self.use_points or self.use_bbox:
-            masks, scores = self.predict_w_points_bbox(sam_input_points, bboxes, sam_neg_input_points, query_image, pred, return_logits=True if self.training else False, sam_mask_input=_soft_mask_input)
+            if self.use_mask:
+                masks, scores = self.predict_w_masks(sam_input_masks, query_image, original_size)
+
+            start_time = time.time()
+            if self.use_points or self.use_bbox:
+                masks, scores = self.predict_w_points_bbox(
+                    sam_input_points,
+                    bboxes,
+                    sam_neg_input_points,
+                    query_image,
+                    pred,
+                    return_logits=True if self.training else False,
+                    sam_mask_input=_soft_mask_input,
+                )
         # print(f"predicting w points/bbox took {time.time() - start_time} seconds")
 
         # 步骤 10：结果融合与输出尺寸还原

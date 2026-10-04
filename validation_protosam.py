@@ -25,7 +25,9 @@ from models.qspa import (
     resolve_support_selection,
     uses_dino_support_pool,
     selection_top_k,
-    select_topk_supports_by_dino_sim,
+    coarse_support_weights,
+    select_supports_by_dino_sim,
+    select_top1_supports_by_dino_sim,
 )
 from models.polyp_support import (
     build_support_pool_by_dataset,
@@ -33,6 +35,11 @@ from models.polyp_support import (
     resolve_pool_indices,
     resolve_query_dataset,
     select_random_matched_support,
+)
+from models.alp_support import (
+    build_alp_support_pool,
+    make_alp_support_loader,
+    resolve_alp_support_scan_ids,
 )
 from models.segment_anything.utils.transforms import ResizeLongestSide
 from models.SamWrapper import SamWrapper
@@ -333,10 +340,16 @@ def get_model(_config) -> ProtoSAM:
         raise NotImplementedError(f"base model {_config['base_model']} not implemented")
     
     # ProtoSAM model
-    if _config["protosam_sam_ver"] in  ("sam_h", "sam_b"):
+    if _config["protosam_sam_ver"] in ("sam_h", "sam_b", "sam3"):
         sam_h_checkpoint = "pretrained_model/sam_vit_h.pth"
         sam_b_checkpoint = "pretrained_model/sam_vit_b.pth"
-        sam_checkpoint = sam_h_checkpoint if _config["protosam_sam_ver"] == "sam_h" else sam_b_checkpoint
+        default_sam3 = "/share/home/huafuchen01/huangwei/WangRuiFeng/MedicalSAM3/checkpoint/sam3.pt"
+        if _config["protosam_sam_ver"] == "sam3":
+            sam_checkpoint = _config.get("sam3_checkpoint") or default_sam3
+        elif _config["protosam_sam_ver"] == "sam_h":
+            sam_checkpoint = sam_h_checkpoint
+        else:
+            sam_checkpoint = sam_b_checkpoint
         model = ProtoSAM(image_size = (1024, 1024),
                     coarse_segmentation_model=base_model,
                     use_bbox=_config["use_bbox"],
@@ -375,6 +388,41 @@ def get_fewshot_seg(model) -> FewShotSeg:
     return coarse
 
 
+def load_polyp_path_pairs(txt_path: str):
+    pairs = []
+    with open(txt_path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            image_path, mask_path = line.split()
+            pairs.append((image_path, mask_path))
+    if not pairs:
+        raise ValueError(f"empty polyp split file: {txt_path}")
+    return pairs
+
+
+def apply_polyp_colon_etis_split(te_dataset: PolypDataset, split_dir: str, eval_datasets):
+    """Replace test set with 10% query split; return support path pairs for 90% pool."""
+    if isinstance(eval_datasets, str):
+        eval_datasets = [eval_datasets]
+    if not eval_datasets or len(eval_datasets) != 1:
+        raise ValueError(
+            "polyp_colon_etis_split_dir requires polyp_eval_datasets with exactly one dataset"
+        )
+    ds_name = eval_datasets[0]
+    split_dir = os.path.abspath(split_dir)
+    support_txt = os.path.join(split_dir, f"{ds_name}_support.txt")
+    test_txt = os.path.join(split_dir, f"{ds_name}_test.txt")
+    support_pairs = load_polyp_path_pairs(support_txt)
+    test_pairs = load_polyp_path_pairs(test_txt)
+    te_dataset.images = [p[0] for p in test_pairs]
+    te_dataset.gts = [p[1] for p in test_pairs]
+    te_dataset.size = len(test_pairs)
+    te_dataset.filter_files_and_get_ds_mean_and_std()
+    return support_pairs
+
+
 def get_support_set_polyps(_config, dataset:PolypDataset):
     n_support = _config["n_support"]
     text_file = _config.get("support_txt_file", None)
@@ -386,9 +434,9 @@ def get_support_set_polyps(_config, dataset:PolypDataset):
 
 @torch.no_grad()
 def precompute_polyp_support_embeddings(encoder: FewShotSeg, dataset: PolypDataset, pool_paths, batch_size=4, device="cuda"):
-    """Cache L2-normalized DINO embeddings for the polyp support pool."""
+    """Cache L2-normalized DINO GAP embeddings for the polyp support pool."""
     embs = []
-    for i in tqdm(range(0, len(pool_paths), batch_size), desc="support DINO embeddings"):
+    for i in tqdm(range(0, len(pool_paths), batch_size), desc="support DINO GAP embeddings"):
         batch_imgs = []
         for image_path, gt_path in pool_paths[i:i + batch_size]:
             img, _, _ = dataset.load_support_item(image_path, gt_path)
@@ -400,10 +448,73 @@ def precompute_polyp_support_embeddings(encoder: FewShotSeg, dataset: PolypDatas
 
 
 @torch.no_grad()
+def precompute_polyp_support_spatial_features(
+    encoder: FewShotSeg, dataset: PolypDataset, pool_paths, batch_size=2, device="cuda"):
+    """Cache DINO spatial feature maps for the polyp support pool (CPU float16)."""
+    feats = []
+    for i in tqdm(range(0, len(pool_paths), batch_size), desc="support DINO spatial features"):
+        batch_imgs = []
+        for image_path, gt_path in pool_paths[i:i + batch_size]:
+            img, _, _ = dataset.load_support_item(image_path, gt_path)
+            batch_imgs.append(img)
+        x = torch.cat(batch_imgs, dim=0).to(device)
+        feats.append(encoder.get_features(x).cpu().half())
+        del x
+    return torch.cat(feats, dim=0)
+
+
+@torch.no_grad()
+def precompute_polyp_support_features(
+    encoder: FewShotSeg,
+    dataset: PolypDataset,
+    pool_paths,
+    retrieval_mode="gap",
+    batch_size=4,
+    device="cuda",
+):
+    if retrieval_mode == "spatial":
+        return precompute_polyp_support_spatial_features(
+            encoder, dataset, pool_paths, batch_size=max(1, batch_size // 2), device=device)
+    return precompute_polyp_support_embeddings(
+        encoder, dataset, pool_paths, batch_size=batch_size, device=device)
+
+
+@torch.no_grad()
+def precompute_alp_support_features(
+    encoder: FewShotSeg,
+    load_support_fn,
+    pool_size: int,
+    retrieval_mode="spatial",
+    batch_size=4,
+    device="cuda",
+):
+    """Cache DINO features for an ALP support-slice pool."""
+    feats = []
+    desc = (
+        "support DINO GAP embeddings"
+        if retrieval_mode == "gap"
+        else "support DINO spatial features"
+    )
+    step = max(1, batch_size // 2) if retrieval_mode == "spatial" else batch_size
+    for start in tqdm(range(0, pool_size, step), desc=desc):
+        batch_imgs = []
+        for pool_idx in range(start, min(start + step, pool_size)):
+            img, _, _ = load_support_fn(pool_idx)
+            batch_imgs.append(img)
+        x = torch.cat(batch_imgs, dim=0).to(device)
+        if retrieval_mode == "spatial":
+            feats.append(encoder.get_features(x).cpu().half())
+        else:
+            feats.append(encoder.get_image_embedding(x).cpu())
+        del x
+    return torch.cat(feats, dim=0)
+
+
+@torch.no_grad()
 def select_polyp_support_by_dino_sim(encoder, query_images, support_embs, pool_paths, dataset: PolypDataset):
-    """Legacy top-1 wrapper. Prefer select_topk_supports_by_dino_sim."""
-    images, masks, cases, weights, info = select_topk_supports_by_dino_sim(
-        encoder, query_images, support_embs, pool_paths, dataset, top_k=1, temperature=0.07)
+    """Legacy top-1 wrapper. Prefer select_top1_supports_by_dino_sim."""
+    images, masks, cases, weights, info = select_top1_supports_by_dino_sim(
+        encoder, query_images, support_embs, pool_paths=pool_paths, dataset=dataset)
     best = info["selected_indices"][0]
     return images, masks, cases[0], best, info["selected_similarities"][0]
 
@@ -454,12 +565,15 @@ def main(_run, _config, _log):
     support_selection = resolve_support_selection(_config)
     qspa_top_k = selection_top_k(support_selection, _config.get("top_k", 5))
     qspa_temp = float(_config.get("prototype_temperature", 0.07))
+    support_retrieval_mode = _config.get("support_retrieval_mode", "gap")
+    spatial_chunk_size = int(_config.get("support_spatial_chunk_size", 64))
     polyp_match_support = bool(_config.get("polyp_match_support_to_query", False))
     polyp_unmatched_policy = _config.get("polyp_unmatched_support_policy", "skip")
     print(
         f"config do_cca: {_config['do_cca']}, use_bbox: {_config['use_bbox']}, "
         f"support_select_mode: {_config.get('support_select_mode', 'random')}, "
         f"support_selection: {support_selection}, top_k: {qspa_top_k}, T: {qspa_temp}, "
+        f"support_retrieval_mode: {support_retrieval_mode}, "
         f"polyp_match_support_to_query: {polyp_match_support}, "
         f"polyp_unmatched_support_policy: {polyp_unmatched_policy}"
     )
@@ -479,7 +593,18 @@ def main(_run, _config, _log):
     if POLYPS in _config["dataset"].lower():
         tr_dataset, te_dataset = get_polyp_dataset(sam_trans=sam_trans, image_size=(1024, 1024))
         eval_ds = _config.get("polyp_eval_datasets", None)
-        if eval_ds:
+        colon_etis_support_pairs = None
+        split_dir = _config.get("polyp_colon_etis_split_dir")
+        if split_dir:
+            eval_ds = _config.get("polyp_eval_datasets")
+            colon_etis_support_pairs = apply_polyp_colon_etis_split(
+                te_dataset, split_dir, eval_ds)
+            _config["_colon_etis_support_pairs"] = colon_etis_support_pairs
+            _log.info(
+                f'Polyp 9:1 split from {split_dir}: '
+                f'test={te_dataset.size} support={len(colon_etis_support_pairs)}'
+            )
+        elif eval_ds:
             if isinstance(eval_ds, str):
                 eval_ds = [eval_ds]
             keep_img, keep_gt = [], []
@@ -491,6 +616,8 @@ def main(_run, _config, _log):
             te_dataset.gts = keep_gt
             te_dataset.size = len(keep_img)
             _log.info(f'Polyp eval subsets {list(eval_ds)}: {te_dataset.size} images')
+        else:
+            colon_etis_support_pairs = None
     elif CHAOS in _config["dataset"].lower() or SABS in _config["dataset"].lower():
         tr_dataset, te_dataset = get_nii_dataset(_config, _config["input_size"][0]) 
     else:
@@ -537,37 +664,66 @@ def main(_run, _config, _log):
     support_select_mode = _config.get("support_select_mode", "random")
     polyp_pool_paths = None
     polyp_pool_by_dataset = None
-    polyp_support_embs = None
+    polyp_support_features = None
+    alp_load_support_fn = None
     fewshot_seg = None
     qspa_weights = None
     qspa_info = None
     polyp_support_skipped = 0
     
-    if is_alp_ds:
+    if is_alp_ds and uses_dino_support_pool(support_selection):
+        manual_dataset = te_dataset.dataset
+        curr_class = te_dataset.get_curr_cls()
+        class_idx = [curr_class]
+        support_scan_id = resolve_alp_support_scan_ids(_config, manual_dataset)
+        alp_support_pool = build_alp_support_pool(
+            manual_dataset, curr_class, support_scan_id)
+        alp_load_support_fn = make_alp_support_loader(
+            manual_dataset, alp_support_pool, curr_class, class_idx)
+        _log.info(
+            f'ALP QSPA support pool size: {len(alp_support_pool)} '
+            f'scans={support_scan_id} selection={support_selection} '
+            f'top_k={qspa_top_k} retrieval={support_retrieval_mode}'
+        )
+        fewshot_seg = get_fewshot_seg(model)
+        fewshot_seg.eval()
+        polyp_support_features = precompute_alp_support_features(
+            fewshot_seg, alp_load_support_fn, len(alp_support_pool),
+            retrieval_mode=support_retrieval_mode)
+        if support_retrieval_mode == "gap":
+            polyp_support_features = polyp_support_features.cuda()
+    elif is_alp_ds:
         all_support_images, all_support_fg_mask, support_scan_id = get_support_set(_config, te_dataset)
     elif is_polyp_ds and (uses_dino_support_pool(support_selection) or polyp_match_support):
-        polyp_pool_paths = tr_dataset.get_support_pool_paths(
-            text_file=_config.get("support_txt_file", None)
-        )
+        colon_etis_support_pairs = _config.get("_colon_etis_support_pairs")
+        if colon_etis_support_pairs is not None:
+            polyp_pool_paths = list(colon_etis_support_pairs)
+        else:
+            polyp_pool_paths = tr_dataset.get_support_pool_paths(
+                text_file=_config.get("support_txt_file", None)
+            )
         polyp_pool_by_dataset = build_support_pool_by_dataset(polyp_pool_paths)
         _log.info(
             f'Polyp support pool size: {len(polyp_pool_paths)} '
             f'by_dataset={pool_summary(polyp_pool_by_dataset)} '
-            f'match_query={polyp_match_support} selection={support_selection} top_k={qspa_top_k}'
+            f'match_query={polyp_match_support} selection={support_selection} '
+            f'top_k={qspa_top_k} retrieval={support_retrieval_mode}'
         )
         if uses_dino_support_pool(support_selection):
             fewshot_seg = get_fewshot_seg(model)
             fewshot_seg.eval()
-            polyp_support_embs = precompute_polyp_support_embeddings(
-                fewshot_seg, tr_dataset, polyp_pool_paths)
-            polyp_support_embs = polyp_support_embs.cuda()
+            polyp_support_features = precompute_polyp_support_features(
+                fewshot_seg, tr_dataset, polyp_pool_paths,
+                retrieval_mode=support_retrieval_mode)
+            if support_retrieval_mode == "gap":
+                polyp_support_features = polyp_support_features.cuda()
     elif is_polyp_ds:
         support_images, support_fg_mask, case = get_support_set_polyps(_config, tr_dataset)
         
     with tqdm(testloader) as pbar: 
         for idx, sample_batched in enumerate(tqdm(testloader)):
             case = sample_batched['case'][0]
-            if is_alp_ds:
+            if is_alp_ds and not uses_dino_support_pool(support_selection):
                 if _config.get("ablation_mode") == "presence_score":
                     if len(all_support_images) != 1:
                         raise RuntimeError(
@@ -611,10 +767,16 @@ def main(_run, _config, _log):
                         continue
 
                 if uses_dino_support_pool(support_selection):
-                    support_images, support_fg_mask, _, qspa_weights, qspa_info = select_topk_supports_by_dino_sim(
-                        fewshot_seg, query_images, polyp_support_embs, polyp_pool_paths, tr_dataset,
+                    support_images, support_fg_mask, _, qspa_weights, qspa_info = select_supports_by_dino_sim(
+                        fewshot_seg, query_images, polyp_support_features,
+                        support_selection=support_selection,
                         top_k=qspa_top_k, temperature=qspa_temp,
-                        pool_indices=pool_indices, query_dataset=query_dataset)
+                        pool_paths=polyp_pool_paths, dataset=tr_dataset,
+                        pool_indices=pool_indices, query_dataset=query_dataset,
+                        retrieval_mode=support_retrieval_mode,
+                        spatial_chunk_size=spatial_chunk_size)
+                    qspa_weights = coarse_support_weights(
+                        support_selection, qspa_weights, qspa_info["top_k"])
                     model.last_qspa_info = {
                         k: v for k, v in qspa_info.items() if k != "all_similarities"
                     }
@@ -641,6 +803,21 @@ def main(_run, _config, _log):
                             f"Matched random support dataset={query_dataset} "
                             f"indices={match_info['selected_indices']}"
                         )
+            elif is_alp_ds and uses_dino_support_pool(support_selection) and alp_load_support_fn is not None:
+                support_images, support_fg_mask, _, qspa_weights, qspa_info = select_supports_by_dino_sim(
+                    fewshot_seg, query_images, polyp_support_features,
+                    support_selection=support_selection,
+                    top_k=qspa_top_k, temperature=qspa_temp,
+                    retrieval_mode=support_retrieval_mode,
+                    spatial_chunk_size=spatial_chunk_size,
+                    load_support_fn=alp_load_support_fn,
+                    query_dataset=str(case),
+                )
+                qspa_weights = coarse_support_weights(
+                    support_selection, qspa_weights, qspa_info["top_k"])
+                model.last_qspa_info = {
+                    k: v for k, v in qspa_info.items() if k != "all_similarities"
+                }
             
             n_try = 1
             with torch.no_grad():
@@ -799,7 +976,7 @@ def main(_run, _config, _log):
                 "positive_mdice": f"{_safe_mean(mean_dice):.4f}",
                 "positive_miou": f"{_safe_mean(mean_iou):.4f}, n_try: {n_try}",
             }
-            if is_polyp_ds and uses_dino_support_pool(support_selection) and qspa_info is not None:
+            if uses_dino_support_pool(support_selection) and qspa_info is not None:
                 ranked0 = qspa_info["ranked"][0]
                 postfix["supp"] = f"{ranked0[0]}:{ranked0[1]:.3f}x{len(qspa_info['ranked'])}"
             pbar.set_postfix_str(postfix)

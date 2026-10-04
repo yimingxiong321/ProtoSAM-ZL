@@ -1,11 +1,19 @@
 # Python / IDE
 __pycache__/
+*.py[cod]
 .vscode/
+.idea/
 debug/
+
+# Cursor / local indexing
+.cursorindexingignore
+.specstory/
 
 # Experiments & outputs
 exps/
 test_*/
+results/
+scripts/
 official_benchmark_rerun/
 fivefold_logs/
 generalization_logs/
@@ -18,12 +26,15 @@ presence_srqs_eval/
 
 # Models & weights
 pretrained_model/*
+!pretrained_model/.gitkeep
 *.pth
 *.pt
 *.ckpt
+*.safetensors
 
 # Datasets & archives
 data/
+external/ProtoSAM-original/data/
 FAME-main/
 FAME-main.zip
 fame_protosam/

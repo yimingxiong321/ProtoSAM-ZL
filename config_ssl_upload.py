@@ -106,13 +106,17 @@ def cfg():
     use_neg_points=False
     n_support=1 # num support images
     support_select_mode="random" # random | dino_sim (legacy; dino_sim maps to support_selection=top1)
-    support_selection="random" # random | top1 | topk_weighted (QSPA)
-    top_k=5 # used when support_selection=topk_weighted
+    support_selection="random" # random | top1 | topk_weighted (QSPA multi-support fusion)
+    top_k=5 # used only when support_selection=topk_weighted (ignored for top1)
     prototype_temperature=0.07 # softmax temperature over top-K DINOv2 cosine sims
+    support_retrieval_mode="gap" # gap | spatial (spatial uses DINO feature-map similarity)
+    support_spatial_chunk_size=64 # batch size when scoring spatial support features
     polyp_match_support_to_query=False # True: support only from query's Polyp sub-dataset train pool
     polyp_unmatched_support_policy="skip" # skip | fallback_all | error when train pool missing (Colon/ETIS)
     polyp_eval_datasets=None # None=all; e.g. ['CVC-ColonDB'] to eval a subset
-    protosam_sam_ver="sam_h" # or medsam
+    polyp_colon_etis_split_dir=None # dir with {Dataset}_support.txt and {Dataset}_test.txt (9:1 split)
+    protosam_sam_ver="sam_h" # sam_h | sam_b | sam3 | medsam
+    sam3_checkpoint="/share/home/huafuchen01/huangwei/WangRuiFeng/MedicalSAM3/checkpoint/sam3.pt"
     grad_accumulation_steps=1
     ttt=False
     reset_after_slice=True # for TTT, if to reset the model after finetuning on each slice
