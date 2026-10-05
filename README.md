@@ -9,7 +9,7 @@ Following the extraction of an initial mask, we use numerical methods to generat
 
 ## 相对原版 ProtoSAM 的扩展（QSPA）
 
-在 **不改变 SAM prompt 提取与推理** 的前提下，本仓库在 coarse 阶段增加了 **Query-conditioned Support Prototype Aggregation（QSPA）** 及可复现实验协议。实现见 `models/qspa.py`、`models/grid_proto_fewshot.py`（Scheme A 融合）、`validation_protosam.py`；Polyp / 3D 辅助见 `models/polyp_support.py`、`models/alp_support.py`；一键评测见 `official_benchmark_rerun/`。
+在 **不改变 SAM prompt 提取与推理** 的前提下，本仓库在 coarse 阶段增加了 **Query-conditioned Support Prototype Aggregation（QSPA）** 及可复现实验协议。实现见 `models/qspa.py`、`models/grid_proto_fewshot.py`（Scheme A 融合）、`validation_protosam.py`；DINO backbone 函数式封装见 `models/dino_backbone.py`（默认 **DINOv2** 不变，可选 **`modelname=dinov3_l16` / `dinov3_h16`** → 本地 HF 目录 `pretrained_model/dinov3-vitl16-pretrain-lvd1689m/`、`pretrained_model/dinov3-vith16plus-pretrain-lvd1689m/`，由 Meta `.pth` 生成见 `scripts/build_dinov3_hf_snapshot.py --variant vitl16|vith16plus`）；Polyp / 3D 辅助见 `models/polyp_support.py`、`models/alp_support.py`；一键评测见 `official_benchmark_rerun/`。
 
 ### 方法改进（三点）
 
@@ -28,9 +28,8 @@ Following the extraction of an initial mask, we use numerical methods to generat
 
 **Kvasir**（100 test）+ **CVC-ClinicDB**（62 test）：matched 同子集 support 池。**CVC-ColonDB**（38 test）+ **ETIS-LaribPolypDB**（20 test）：**9:1** support/test（`create_colon_etis_91_split.py`）。`top1` = DINO **GAP** 单 support；`k3`/`k5` = **QSPA**（`topk_weighted`）。**All Dice / All IoU**：有四子集时用 **100:62:38:20** 加权；缺 Colon/ETIS 时用 **100:62**（仅 Kvasir+Clinic）。SAM1 精修为 **bbox + Conf/Cent 点**（`point_mode=both`，与 ProtoSAM 默认一致）。
 
-#### 精修 backbone：SAM 1（`sam_vit_h`）
+#### SAM 1 Protosam Baseline
 
-Colon / ETIS **GAP QSPA**（k3/k5）：`polyp_colon_etis_91_qspa_gap_k3`、`polyp_colon_etis_91_qspa_gap_k5`。
 
 | K | 检索 | All Dice | All IoU | Kvasir Dice | Kvasir IoU | Clinic Dice | Clinic IoU | Colon Dice | Colon IoU | ETIS Dice | ETIS IoU |
 |---|------|----------|---------|-------------|------------|-------------|------------|------------|-----------|-----------|----------|
@@ -40,25 +39,77 @@ Colon / ETIS **GAP QSPA**（k3/k5）：`polyp_colon_etis_91_qspa_gap_k3`、`poly
 | 3 | spatial | 84.04 | 76.59 | 81.55 | 73.56 | 87.16 | 80.59 | 82.92 | 75.16 | 88.95 | 82.04 |
 | 5 | spatial | 85.09 | 77.66 | 82.41 | 74.73 | 87.32 | 80.74 | 86.90 | 78.67 | 88.13 | 80.84 |
 
+#### 对比：DINOv2-L/14 vs DINOv3-H+（SAM1 精修不变）
+
+
+| K | 检索 | DINOv2 All Dice | DINOv3 H+ All Dice | Δ | DINOv2 All IoU | DINOv3 H+ All IoU | Δ |
+|---|------|-------------|-------------|---|------------|------------|---|
+| 1 | GAP | 79.66 | **80.89** | +1.23 | 72.15 | **73.33** | +1.18 |
+| 3 | GAP | 84.53 | **83.84** | −0.69 | 77.25 | **76.58** | −0.67 |
+| 5 | GAP | 83.95 | **83.45** | −0.50 | 76.90 | **76.56** | −0.34 |
+| 3 | spatial | 84.04 | **84.38** | +0.34 | 76.59 | **77.47** | +0.88 |
+| 5 | spatial | 85.09 | **83.61** | −1.48 | 77.66 | **76.88** | −0.78 |
+
+分数据集 **Dice**（每格为 **D2 / H+ / Δ**，单位百分点）：
+
+| K | 检索 | Kvasir | Clinic | Colon | ETIS |
+|---|------|--------|--------|-------|------|
+| 1 | GAP | 72.96 / **82.62** / +9.66 | 85.98 / 77.74 / −8.24 | 83.09 / 79.95 / −3.14 | 87.10 / 83.75 / −3.35 |
+| 3 | GAP | 81.63 / **85.64** / +4.01 | 85.82 / 80.28 / −5.54 | 88.08 / 81.70 / −6.38 | 88.34 / **89.99** / +1.65 |
+| 5 | GAP | 82.31 / 84.11 / +1.80 | 85.12 / 82.12 / −3.00 | 83.96 / 81.94 / −2.02 | 88.46 / 87.15 / −1.31 |
+| 3 | spatial | 81.55 / 84.75 / +3.20 | 87.16 / 84.69 / −2.47 | 82.92 / 81.78 / −1.14 | 88.95 / 86.56 / −2.39 |
+| 5 | spatial | 82.41 / 84.15 / +1.74 | 87.32 / 85.04 / −2.28 | 86.90 / 82.15 / −4.75 | 88.13 / 79.23 / −8.90 |
+
+**DINOv3-H+** 绝对值（与 D2 SAM1 表同列）：
+
+| K | 检索 | All Dice | All IoU | Kvasir Dice | Clinic Dice | Colon Dice | ETIS Dice |
+|---|------|----------|---------|-------------|-------------|------------|-----------|
+| 1 | GAP | 80.89 | 73.33 | 82.62 | 77.74 | 79.95 | 83.75 |
+| 3 | GAP | 83.84 | 76.58 | 85.64 | 80.28 | 81.70 | 89.99 |
+| 5 | GAP | 83.45 | 76.56 | 84.11 | 82.12 | 81.94 | 87.15 |
+| 3 | spatial | 84.38 | 77.47 | 84.75 | 84.69 | 81.78 | 86.56 |
+| 5 | spatial | 83.61 | 76.88 | 84.15 | 85.04 | 82.15 | 79.23 |
+
+简要结论：H+ 在 **Kvasir** 上多数高于 D2；**Clinic / Colon** 多数略低。**加权 All**：**top1 GAP**（+1.23 Dice）、**spatial k=3**（+0.34）优于 D2；**spatial k=5** 仍低约 1.5 Dice（ETIS 79.23 拉低明显）。top1 上 Kvasir↑、Clinic↓ 幅度大，与 D2 检索/粗分割差异需单独分析。
+
+#### Coarse backbone 对比：DINOv3 ViT-L/16 vs DINOv3-H+（`dinov3_l16` vs `dinov3_h16`，SAM1 精修不变）
+
+**DINOv3-L 绝对值**（与 D2 / H+ SAM1 表同列）：
+
+| K | 检索 | All Dice | All IoU | Kvasir Dice | Clinic Dice | Colon Dice | ETIS Dice |
+|---|------|----------|---------|-------------|-------------|------------|-----------|
+| 1 | GAP | 80.92 | 73.76 | 80.43 | 81.79 | 78.98 | 84.40 |
+| 3 | GAP | 83.13 | 76.07 | 82.96 | 85.45 | 78.60 | 85.38 |
+| 5 | GAP | 83.16 | 76.28 | 83.50 | 83.30 | 81.56 | 84.00 |
+| 3 | spatial | 83.84 | 76.80 | 84.28 | 85.24 | 79.65 | 85.23 |
+| 5 | spatial | 83.83 | 76.96 | 84.64 | 85.39 | 79.93 | 82.39 |
+
+**L vs H+**（Δ = H+ − L，单位百分点）：
+
+| K | 检索 | L All Dice | H+ All Dice | Δ | L All IoU | H+ All IoU | Δ |
+|---|------|------------|-------------|---|-----------|------------|---|
+| 1 | GAP | **80.92** | 80.89 | −0.03 | **73.76** | 73.33 | −0.43 |
+| 3 | GAP | 83.13 | **83.84** | +0.72 | 76.07 | **76.58** | +0.51 |
+| 5 | GAP | 83.16 | **83.45** | +0.29 | 76.28 | **76.56** | +0.28 |
+| 3 | spatial | 83.84 | **84.38** | +0.55 | 76.80 | **77.47** | +0.67 |
+| 5 | spatial | **83.83** | 83.61 | −0.22 | **76.96** | 76.88 | −0.08 |
+
+分数据集 **Dice**（每格 **L / H+ / Δ**）：
+
+| K | 检索 | Kvasir | Clinic | Colon | ETIS |
+|---|------|--------|--------|-------|------|
+| 1 | GAP | 80.43 / **82.62** / +2.19 | **81.79** / 77.74 / −4.05 | 78.98 / **79.95** / +0.97 | **84.40** / 83.75 / −0.65 |
+| 3 | GAP | 82.96 / **85.64** / +2.68 | **85.45** / 80.28 / −5.17 | 78.60 / **81.70** / +3.10 | 85.38 / **89.99** / +4.61 |
+| 5 | GAP | 83.50 / **84.11** / +0.60 | **83.30** / 82.12 / −1.18 | 81.56 / **81.94** / +0.38 | 84.00 / **87.15** / +3.15 |
+| 3 | spatial | 84.28 / **84.75** / +0.46 | **85.24** / 84.69 / −0.54 | 79.65 / **81.78** / +2.14 | 85.23 / **86.56** / +1.34 |
+| 5 | spatial | **84.64** / 84.15 / −0.49 | **85.39** / 85.04 / −0.35 | 79.93 / **82.15** / +2.22 | **82.39** / 79.23 / −3.16 |
+
+简要结论：**L 与 H+ 加权 All 接近**（top1 略优 L，k3/k5 GAP 与 spatial k3 略优 H+，spatial k5 All 略优 L）。**Clinic（matched）上 L 五组均高于 H+**（约 0.4–5.2 Dice）；**Kvasir / Colon / ETIS（k3 GAP）** H+ 更高。**spatial k5 ETIS** L 明显优于 H+（82.39 vs 79.23），是 L 在 All 上反超 H+ 的主因。相对 D2，**L top1 All（80.92）** 介于 D2（79.66）与 H+（80.89）之间，且 **Kvasir–Clinic 更均衡**（无 H+ 式 Clinic 大幅回落）。
+
 #### 精修 backbone：SAM 3（`MedicalSAM3/checkpoint/sam3.pt`）
 
-与上表 **相同 QSPA / matched 配置**，仅将 `protosam_sam_ver=sam3`。一键复现（**GPU1 ×2** top1 + gap k3，**GPU3 ×3** gap k5 + spatial k3/k5）：
 
-```bash
-cd official_benchmark_rerun && bash launch_polyp_sam3_parallel.sh
-# 修复 adapter 后重跑（gpu01 后台示例）：
-# nohup bash launch_polyp_sam3_rerun.sh >> polyp_sam3_parallel/rerun_nohup.out 2>&1 &
-```
-
-结果目录：`official_benchmark_rerun/polyp_sam3_matched/`。跑完后汇总：
-
-```bash
-python official_benchmark_rerun/summarize.py \
-  --root official_benchmark_rerun/polyp_sam3_matched \
-  --output official_benchmark_rerun/polyp_sam3_matched/summary.csv
-```
-
-**精修提示：text `"polyp"` + coarse bbox（T+I，无 Conf/Cent 点）** — Colon/ETIS：`polyp_sam3_colon_etis_91_bboxonly/`
+**精修提示：text `"polyp"` + coarse bbox（T+I，无 Conf/Cent 点）**
 
 | K | 检索 | All Dice | All IoU | Kvasir Dice | Kvasir IoU | Clinic Dice | Clinic IoU | Colon Dice | Colon IoU | ETIS Dice | ETIS IoU |
 |---|------|----------|---------|-------------|------------|-------------|------------|------------|-----------|-----------|----------|
@@ -68,7 +119,9 @@ python official_benchmark_rerun/summarize.py \
 | 3 | spatial | 82.15 | 74.25 | 78.14 | 69.70 | 85.85 | 78.64 | 83.28 | 75.63 | 88.56 | 80.82 |
 | 5 | spatial | 82.76 | 75.02 | 79.47 | 71.61 | 84.41 | 77.26 | 86.25 | 77.91 | 87.47 | 79.66 |
 
-**精修提示：T+I + Conf/Cent 前景点**（`SAM3_USE_COARSE_POINTS=1`，与 SAM1 同 `point_mode=both`）— Colon/ETIS：`polyp_sam3_colon_etis_91_ti_points/`
+结论：整体比ProtoSAM 低了2个点。但这不太公平，因为protosam的prompt是bbox和点（sam1不接受 text prompt）
+
+**精修提示：T+I + Conf/Cent 前景点**
 
 | K | 检索 | All Dice | All IoU | Kvasir Dice | Kvasir IoU | Clinic Dice | Clinic IoU | Colon Dice | Colon IoU | ETIS Dice | ETIS IoU |
 |---|------|----------|---------|-------------|------------|-------------|------------|------------|-----------|-----------|----------|
@@ -78,11 +131,18 @@ python official_benchmark_rerun/summarize.py \
 | 3 | spatial | 83.26 | 75.66 | 79.71 | 71.34 | 86.74 | 80.20 | 83.69 | 76.18 | 89.36 | 82.22 |
 | 5 | spatial | 84.04 | 76.52 | 80.63 | 72.75 | 86.53 | 79.90 | 86.82 | 78.77 | 88.05 | 80.62 |
 
-Colon/ETIS 补跑（单数据集）：`bash official_benchmark_rerun/run_polyp_colon_etis_sam3.sh <mode> CVC-ColonDB 0`；README 空位批量：`bash official_benchmark_rerun/launch_polyp_readme_gaps_4way.sh`（gpu01，GPU1×2+GPU3×2）。
+结论：加上点提示后，prompt相比 protosam 多了 text prompt，此时整体比使用 sam1 的protosam低了 0.5 个点左右
 
 > **SAM3 接入（2026-10）**：`models/sam3_grounding.py` — MedSAM3 式 **T+I**（`text="polyp"` + coarse **bbox**）；可选将 ProtoSAM 的 **Conf/Cent** 写入 `input_points`（`SAM3_USE_COARSE_POINTS=1`）。**SAM1 仍走 `SamPredictor`**。Matched 重跑：`launch_polyp_sam3_parallel.sh`。
 
-简要结论（SAM1，四集合并 All）：**top1 相对 QSPA（k≥3）在 All 上约低 4–5 个 Dice 点**；Colon 上 **k5 spatial QSPA 明显优于 top1 / k3**，top1 与 k3 接近；ETIS 上 **k3 spatial 略优于 k5**。复现：`polyp_colon_etis_91_top1`、`polyp_colon_etis_91_qspa_k3`、`polyp_colon_etis_91_qspa`（k5 spatial）。
+简要结论（SAM1，四集合并 All）：**top1 相对 QSPA（k≥3）在 All 上约低 4–5 个 Dice 点**；Colon 上 **k5 spatial QSPA 明显优于 top1 / k3**，top1 与 k3 接近；ETIS 上 **k3 spatial 略优于 k5**。
+
+### 总结
+1.引入dinov3替代v2整体并没有带来结果的提升。
+
+2.引入sam3取代sam1反而整体结果下降了，而且是在比sam1多了text prompt的情况下。
+
+
 
 ## How To Run
 ### 1. Data preprocessing
@@ -118,6 +178,8 @@ Please refer to `backbone.sh` for further configurations.
 Put all SAM checkpoint like sam_vit_b.pth, sam_vit_h.pth, medsam_vit_b.pth into the `pretrained_model` directory. \
 Checkpoints are available at [SAM](https://github.com/facebookresearch/segment-anything) and [MedSAM](https://github.com/bowang-lab/MedSAM). \
 For **SAM 3** polyp/QSPA runs set `protosam_sam_ver=sam3` and `sam3_checkpoint=/path/to/sam3.pt` (default points to `MedicalSAM3/checkpoint/sam3.pt` on our cluster).
+
+**DINOv3 ViT-L/16 / ViT-H+ (`modelname=dinov3_l16` | `dinov3_h16`)**: place Meta `.pth` under `pretrained_model/`, run `python scripts/build_dinov3_hf_snapshot.py --variant vitl16` or `--variant vith16plus` to create the HF dirs (defaults in `config_ssl_upload.py`). Requires `pip install -r requirements-dinov3.txt`. Smoke: `python scripts/smoke_dinov3_backbone.py`.
 
 ```
 ./run_protosam.sh [MODALITY] [LABEL_SET]

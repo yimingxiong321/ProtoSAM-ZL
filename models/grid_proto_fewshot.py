@@ -76,11 +76,26 @@ class FewShotSeg(nn.Module):
                 'facebookresearch/dinov2', 'dinov2_vitb14')
             self.config['feature_hw'] = [max(
                 self.image_size//14, DEFAULT_FEATURE_SIZE), max(self.image_size//14, DEFAULT_FEATURE_SIZE)]
+        elif self.config['which_model'] in ('dinov3_l16', 'dinov3_h16'):
+            from models.dino_backbone import feature_hw_for_image, load_dino_encoder
+
+            wm = self.config['which_model']
+            hf_id = self.config.get("dinov3_hf_id")
+            self.encoder = load_dino_encoder(wm, dinov3_hf_id=hf_id)
+            self.config['feature_hw'] = list(
+                feature_hw_for_image(self.image_size, wm)
+            )
         else:
             raise NotImplementedError(
                 f'Backbone network {self.config["which_model"]} not implemented')
 
         if self.config['lora'] > 0:
+            from models.dino_backbone import is_dinov3_backbone
+
+            if is_dinov3_backbone(self.config['which_model']):
+                raise NotImplementedError(
+                    "LoRA on DINOv3 backbones is not supported yet; use lora=0"
+                )
             self.encoder.requires_grad_(False)
             print(f'Injecting LoRA with rank:{self.config["lora"]}')
             encoder_lora_params = inject_trainable_lora(
@@ -91,18 +106,21 @@ class FewShotSeg(nn.Module):
         if self.config['which_model'] == 'dlfcn_res101':
             img_fts = self.encoder(imgs_concat, low_level=False)
         elif 'dino' in self.config['which_model']:
-            # resize imgs_concat to the closest size that is divisble by 14
-            imgs_concat = F.interpolate(imgs_concat, size=(
-                self.image_size // 14 * 14, self.image_size // 14 * 14), mode='bilinear')
-            dino_fts = self.encoder.forward_features(imgs_concat)
-            img_fts = dino_fts["x_norm_patchtokens"]  # B, HW, C
-            img_fts = img_fts.permute(0, 2, 1)  # B, C, HW
-            C, HW = img_fts.shape[-2:]
-            img_fts = img_fts.view(-1, C, int(HW**0.5),
-                                   int(HW**0.5))  # B, C, H, W
-            if HW < DEFAULT_FEATURE_SIZE ** 2:
-                img_fts = F.interpolate(img_fts, size=(
-                    DEFAULT_FEATURE_SIZE, DEFAULT_FEATURE_SIZE), mode='bilinear')  # this is if h,w < (32,32)
+            from models.dino_backbone import (
+                forward_dino_patch_features,
+                is_dinov2_backbone,
+                is_dinov3_backbone,
+            )
+
+            wm = self.config['which_model']
+            if is_dinov2_backbone(wm) or is_dinov3_backbone(wm):
+                img_fts = forward_dino_patch_features(
+                    self.encoder, wm, imgs_concat, self.image_size
+                )
+            else:
+                raise NotImplementedError(
+                    f'Backbone network {wm} not implemented'
+                )
         else:
             raise NotImplementedError(
                 f'Backbone network {self.config["which_model"]} not implemented')
@@ -127,15 +145,24 @@ class FewShotSeg(nn.Module):
         proto_hw = self.config["proto_grid_size"]
 
         if self.config['cls_name'] == 'grid_proto':
+            from models.dino_backbone import is_dino_backbone, prototype_embed_dim
+
             embed_dim = 256
-            if 'dinov2_b14' in self.config['which_model']:
+            if is_dino_backbone(self.config['which_model']):
+                embed_dim = prototype_embed_dim(self.config['which_model'])
+            elif 'dinov2_b14' in self.config['which_model']:
                 embed_dim = 768
             elif 'dinov2_l14' in self.config['which_model']:
                 embed_dim = 1024
             self.cls_unit = MultiProtoAsConv(proto_grid=[proto_hw, proto_hw], feature_hw=self.config["feature_hw"], embed_dim=embed_dim)  # when treating it as ordinary prototype
             print(f"cls unit feature hw: {self.cls_unit.feature_hw}")
         elif self.config['cls_name'].startswith('dense_fg_'):
-            embed_dim = 768 if 'dinov2_b14' in self.config['which_model'] else 1024
+            from models.dino_backbone import is_dino_backbone, prototype_embed_dim
+
+            if is_dino_backbone(self.config['which_model']):
+                embed_dim = prototype_embed_dim(self.config['which_model'])
+            else:
+                embed_dim = 768 if 'dinov2_b14' in self.config['which_model'] else 1024
             self.cls_unit = DenseForegroundMatcher(
                 proto_grid=[proto_hw, proto_hw],
                 feature_hw=self.config["feature_hw"],
@@ -155,8 +182,12 @@ class FewShotSeg(nn.Module):
                 f"global_anchor={self.cls_unit.global_anchor}"
             )
         elif self.config['cls_name'].startswith('spen'):
+            from models.dino_backbone import is_dino_backbone, prototype_embed_dim
+
             embed_dim = 1024
-            if 'dinov2_b14' in self.config['which_model']:
+            if is_dino_backbone(self.config['which_model']):
+                embed_dim = prototype_embed_dim(self.config['which_model'])
+            elif 'dinov2_b14' in self.config['which_model']:
                 embed_dim = 768
             elif 'dinov2_l14' in self.config['which_model']:
                 embed_dim = 1024

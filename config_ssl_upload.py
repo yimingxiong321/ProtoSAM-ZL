@@ -74,7 +74,8 @@ def cfg():
     debug=False
     skip_no_organ_slices=True
     # Network
-    modelname = 'dlfcn_res101' # resnet 101 backbone from torchvision fcn-deeplab
+    modelname = 'dlfcn_res101' # dlfcn_res101 | dinov2_l14 | dinov2_b14 | dinov2_l14_reg | dinov3_l16 | dinov3_h16
+    dinov3_hf_id = 'pretrained_model/dinov3-vitl16-pretrain-lvd1689m' # local HF snapshot (env DINOV3_HF_ID overrides)
     clsname = None # 
     reload_model_path = None # path for reloading a trained model (overrides ms-coco initialization)
     proto_grid_size = 8 # L_H, L_W = (32, 32) / 8 = (4, 4)  in training
@@ -137,7 +138,8 @@ def cfg():
         'gate_tau': gate_tau,
         'bootstrap_thresh': bootstrap_thresh,
         'bootstrap_mode': bootstrap_mode,
-        'topk_ratio': topk_ratio
+        'topk_ratio': topk_ratio,
+        'dinov3_hf_id': dinov3_hf_id,
     }
 
     task = {
