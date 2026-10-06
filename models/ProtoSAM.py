@@ -206,13 +206,15 @@ class InputFactory(ABC):
 class ProtoSAM(nn.Module):
 
     # 作用：初始化 ProtoSAM 模块，绑定传入的粗分割模型，加载 SAM 权重，并设定后续生成 SAM 提示词（点、框、掩码）的各种模式和参数。
-    def __init__(self, image_size, coarse_segmentation_model:ModelWrapper, sam_pretrained_path="pretrained_model/sam_default.pth", num_points_for_sam=1, use_points=True, use_bbox=False, use_mask=False, debug=False, use_cca=False, point_mode=CONF_MODE, use_sam_trans=True, coarse_pred_only=False, alpnet_image_size=None, use_neg_points=False, ablation_mode='none', ablation_fixes=None, candidate_audit=False, candidate_audit_thresholds=(0.3, 0.4, 0.5), sam3_text_prompt="polyp", ):
+    def __init__(self, image_size, coarse_segmentation_model:ModelWrapper, sam_pretrained_path="pretrained_model/sam_default.pth", num_points_for_sam=1, use_points=True, use_bbox=False, use_mask=False, debug=False, use_cca=False, point_mode=CONF_MODE, use_sam_trans=True, coarse_pred_only=False, alpnet_image_size=None, use_neg_points=False, ablation_mode='none', ablation_fixes=None, candidate_audit=False, candidate_audit_thresholds=(0.3, 0.4, 0.5), sam3_text_prompt="polyp", protosam_sam_ver="sam_h", sam2_config=None, ):
         super().__init__()
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
         self.image_size = image_size
         self.coarse_segmentation_model = coarse_segmentation_model
         self.sam3_text_prompt = sam3_text_prompt
+        self.protosam_sam_ver = protosam_sam_ver
+        self.sam2_config = sam2_config
         self.get_sam(sam_pretrained_path, use_sam_trans) #use_sam_trans的意思是配置图像变换
         self.num_points_for_sam = num_points_for_sam
         self.use_points = use_points
@@ -277,11 +279,17 @@ class ProtoSAM(nn.Module):
 
     # 作用：根据权重路径加载预训练的 SAM 模型及其专用推理器 (SamPredictor)，并可选择性地配置 SAM 特有的图像缩放与归一化变换 (ResizeLongestSide)。     
     def get_sam(self, checkpoint_path, use_sam_trans):
+        from models.sam2_refinement import is_sam2_refinement_ver, load_sam2_image_predictor
         from models.sam3_grounding import is_sam3_checkpoint, load_sam3_grounding_runtime
         from models.sam3_predictor import _SamStub
 
         self.sam3_runtime = None
-        if is_sam3_checkpoint(checkpoint_path):
+        self.sam2_runtime = None
+        self._sam3_backend = False
+        self._sam2_backend = False
+
+        sam_ver = getattr(self, "protosam_sam_ver", "sam_h")
+        if sam_ver == "sam3" or is_sam3_checkpoint(checkpoint_path):
             device = "cuda" if torch.cuda.is_available() else "cpu"
             text_prompt = getattr(self, "sam3_text_prompt", "polyp")
             self.sam3_runtime = load_sam3_grounding_runtime(
@@ -292,15 +300,26 @@ class ProtoSAM(nn.Module):
             self.predictor = None
             self.sam = _SamStub()
             self._sam3_backend = True
+        elif is_sam2_refinement_ver(sam_ver):
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.sam2_runtime = load_sam2_image_predictor(
+                checkpoint_path,
+                config_name=getattr(self, "sam2_config", None),
+                device=device,
+            )
+            self.predictor = None
+            self.sam = _SamStub()
+            self._sam2_backend = True
         else:
-            self._sam3_backend = False
             model_type = "vit_b"  # TODO make generic?
             if "vit_h" in checkpoint_path:
                 model_type = "vit_h"
             self.sam = sam_model_registry[model_type](checkpoint=checkpoint_path).eval()
             self.predictor = SamPredictor(self.sam)
             self.sam.requires_grad_(False)
-        if use_sam_trans:
+        if self._sam3_backend:
+            sam_trans = None
+        elif use_sam_trans:
             sam_trans = ResizeLongestSide(self.sam.image_encoder.img_size)
             sam_trans.pixel_mean = torch.tensor([0, 0, 0]).view(3, 1, 1)
             sam_trans.pixel_std = torch.tensor([1, 1, 1]).view(3, 1, 1)
@@ -1089,7 +1108,7 @@ pred = output_logits.argmax(dim=1)[0]
             # convert points to a list where each item is a list of 2 elements in xy format
             self.plot_most_conf_points(sam_input_points, None, _pred, query_image[0, 0].detach().cpu(), bboxes=bboxes, title=title) # TODO add plots for all points not just the first set of points
 
-        # 步骤 8–9：SAM / SAM3 精修
+        # 步骤 8–9：SAM / SAM2 / SAM3 精修
         if getattr(self, "_sam3_backend", False):
             if self.use_mask:
                 raise NotImplementedError(
@@ -1109,6 +1128,40 @@ pred = output_logits.argmax(dim=1)[0]
                     sam_input_points=sam_input_points,
                     return_logits=bool(self.training),
                 )
+        elif getattr(self, "_sam2_backend", False):
+            from models.sam2_refinement import predict_masks_points_bbox
+
+            if self.use_mask:
+                raise NotImplementedError(
+                    "SAM2 refinement supports box/points only; disable use_mask or use SAM1."
+                )
+            if self.sam2_runtime is None:
+                raise RuntimeError("sam2_runtime is not loaded")
+            # Same uint8 / prompt-space prep as SAM1 (bbox + points stay aligned).
+            if self.sam_trans is None:
+                _qry_sam2 = query_image.permute(1, 2, 0).detach().cpu().numpy()
+            else:
+                _qry_sam2 = self.sam_trans.apply_image_torch(query_image[0])
+                _qry_sam2 = self.sam_trans.preprocess(_qry_sam2)
+                _qry_sam2 = _qry_sam2.permute(1, 2, 0).detach().cpu().numpy()
+
+            _qry_sam2 = (
+                (_qry_sam2 - _qry_sam2.min())
+                / (_qry_sam2.max() - _qry_sam2.min() + 1e-8)
+                * 255
+            ).astype(np.uint8)
+
+            masks, scores = predict_masks_points_bbox(
+                self.sam2_runtime,
+                _qry_sam2,
+                sam_input_points,
+                bboxes,
+                sam_neg_input_points,
+                use_neg_points=self.use_neg_points,
+                use_cca=self.use_cca,
+                ablation_fixes=self.ablation_fixes,
+                return_logits=bool(self.training),
+            )
         else:
             # SAM1：图像预处理为 uint8，再送入 SamPredictor
             if self.sam_trans is None:

@@ -116,7 +116,9 @@ def cfg():
     polyp_unmatched_support_policy="skip" # skip | fallback_all | error when train pool missing (Colon/ETIS)
     polyp_eval_datasets=None # None=all; e.g. ['CVC-ColonDB'] to eval a subset
     polyp_colon_etis_split_dir=None # dir with {Dataset}_support.txt and {Dataset}_test.txt (9:1 split)
-    protosam_sam_ver="sam_h" # sam_h | sam_b | sam3 | medsam
+    protosam_sam_ver="sam_h" # sam_h | sam_b | sam2 | sam3 | medsam
+    sam2_checkpoint="/share/home/huafuchen01/huangwei/XiongYiming/memory-sam/checkpoints/sam2.1_hiera_large.pt"
+    sam2_config=None # optional hydra config_name; default from checkpoint basename
     sam3_checkpoint="/share/home/huafuchen01/huangwei/WangRuiFeng/MedicalSAM3/checkpoint/sam3.pt"
     grad_accumulation_steps=1
     ttt=False

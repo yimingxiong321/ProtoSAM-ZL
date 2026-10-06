@@ -14,7 +14,7 @@ Following the extraction of an initial mask, we use numerical methods to generat
 ### 方法改进（三点）
 
 1. **QSPA + Scheme A（多 support 粗分割融合）**  
-   从 support pool 中按 query 用 DINO 相似度取 Top-K，对相似度做 temperature-scaled softmax 得到权重；**每个 support 仍独立** 构造 fg/bg（及 local grid）prototype 并生成 similarity map，再按权重 **对 map 加权求和**（不对跨 support 的 local prototype 做向量相加）。Coarse 之后的 CCA、box/point 提取不变；精修阶段可选用 **SAM 1**（`protosam_sam_ver=sam_h`）或 **SAM 3**（`protosam_sam_ver=sam3`，权重见 `sam3_checkpoint`，适配代码 `models/sam3_predictor.py`）。
+   从 support pool 中按 query 用 DINO 相似度取 Top-K，对相似度做 temperature-scaled softmax 得到权重；**每个 support 仍独立** 构造 fg/bg（及 local grid）prototype 并生成 similarity map，再按权重 **对 map 加权求和**（不对跨 support 的 local prototype 做向量相加）。Coarse 之后的 CCA、box/point 提取不变；精修阶段可选用 **SAM 1**（`protosam_sam_ver=sam_h`）、**SAM 2.1**（`protosam_sam_ver=sam2`，`models/sam2_refinement.py`）或 **SAM 3**（`protosam_sam_ver=sam3`，`models/sam3_grounding.py`）。
 
 2. **统一的 support 检索与选择框架**  
    配置项 `support_selection`：`random`（原版随机 baseline）、`top1`（DINO 检索单张，不走 QSPA 加权融合）、`topk_weighted`（QSPA）。检索打分 `support_retrieval_mode`：`gap`（全局 embedding 余弦）或 `spatial`（空间特征图相似度再池化）。相关超参：`top_k`、`prototype_temperature`（默认 0.07），见 `config_ssl_upload.py`。
@@ -38,6 +38,14 @@ Following the extraction of an initial mask, we use numerical methods to generat
 | 5 | GAP | 83.95 | 76.90 | 82.31 | 75.09 | 85.12 | 78.67 | 83.96 | 76.35 | 88.46 | 81.52 |
 | 3 | spatial | 84.04 | 76.59 | 81.55 | 73.56 | 87.16 | 80.59 | 82.92 | 75.16 | 88.95 | 82.04 |
 | 5 | spatial | 85.09 | 77.66 | 82.41 | 74.73 | 87.32 | 80.74 | 86.90 | 78.67 | 88.13 | 80.84 |
+
+**原版 random vs K=1（仅 Dice）**：random 来自 `official_benchmark_rerun/polyp_random/`（`support_select_mode=random`，SAM1，四集一次评测；All 为 run 内 `meanDice`）。K=1 为上表 **GAP top1**（matched + Colon/ETIS 9:1，All 为 **100:62:38:20** 加权）。Δ = K=1 − random。
+
+| Support | All Dice | Kvasir | Clinic | Colon | ETIS |
+|---------|----------|--------|--------|-------|------|
+| random（原版） | 68.57 | **81.85** | 69.04 | 66.48 | 65.71 |
+| K=1 （top1） | **79.66** | 72.96 | **85.98** | **83.09** | **87.10** |
+| Δ | +11.09 | −8.89 | +16.94 | +16.61 | +21.39 |
 
 #### 对比：DINOv2-L/14 vs DINOv3-H+（SAM1 精修不变）
 
@@ -106,6 +114,45 @@ Following the extraction of an initial mask, we use numerical methods to generat
 
 简要结论：**L 与 H+ 加权 All 接近**（top1 略优 L，k3/k5 GAP 与 spatial k3 略优 H+，spatial k5 All 略优 L）。**Clinic（matched）上 L 五组均高于 H+**（约 0.4–5.2 Dice）；**Kvasir / Colon / ETIS（k3 GAP）** H+ 更高。**spatial k5 ETIS** L 明显优于 H+（82.39 vs 79.23），是 L 在 All 上反超 H+ 的主因。相对 D2，**L top1 All（80.92）** 介于 D2（79.66）与 H+（80.89）之间，且 **Kvasir–Clinic 更均衡**（无 H+ 式 Clinic 大幅回落）。
 
+#### 精修 backbone：SAM 2.1（`sam2.1_hiera_large.pt`，D2 coarse + bbox/点同 SAM1）
+
+与 SAM1 baseline **相同 QSPA / matched / Colon·ETIS 9:1**；权重默认 `memory-sam/checkpoints/sam2.1_hiera_large.pt`，代码 `models/sam2_refinement.py`（IBISAgent `sam2` 包）。复现：`official_benchmark_rerun/launch_polyp_sam2_dual_a100.sh`（gpu01 **A100 GPU1+GPU3 各一路**）。汇总：
+
+```bash
+python official_benchmark_rerun/polyp_summarize_sam2_readme.py
+python official_benchmark_rerun/polyp_compare_sam1_sam2_table.py
+```
+
+| K | 检索 | All Dice | All IoU | Kvasir Dice | Kvasir IoU | Clinic Dice | Clinic IoU | Colon Dice | Colon IoU | ETIS Dice | ETIS IoU |
+|---|------|----------|---------|-------------|------------|-------------|------------|------------|-----------|-----------|----------|
+| 1 | GAP | 79.08 | 71.54 | 72.14 | 64.34 | 84.81 | 78.15 | 83.55 | 75.00 | 87.49 | 80.48 |
+| 3 | GAP | 84.57 | 77.15 | 81.31 | 73.49 | 85.43 | 78.85 | 89.09 | 81.13 | 89.61 | 82.64 |
+| 5 | GAP | 83.72 | 76.61 | 82.04 | 74.59 | 83.83 | 77.21 | 84.80 | 77.48 | 89.76 | 83.15 |
+| 3 | spatial | 83.97 | 76.39 | 80.90 | 72.50 | 86.81 | 80.16 | 84.11 | 76.66 | 90.28 | 83.67 |
+| 5 | spatial | 84.87 | 77.40 | 81.65 | 73.76 | 87.08 | 80.44 | 87.60 | 79.58 | 88.97 | 82.06 |
+
+**SAM1 / SAM2 / SAM3**（All Dice / IoU；Δ₂−₁ = SAM2−SAM1，Δ₃−₁ = SAM3−SAM1。**SAM3 列为 T+I + Conf/Cent 点**，与 SAM1/SAM2 的 bbox+点一致；纯 T+I 无点见下文 SAM3 小节。）
+
+| K | 检索 | SAM1 Dice | SAM2 Dice | SAM3 Dice | Δ₂−₁ | Δ₃−₁ | SAM1 IoU | SAM2 IoU | SAM3 IoU | Δ₂−₁ | Δ₃−₁ |
+|---|------|-----------|-----------|-----------|------|------|----------|----------|----------|------|------|
+| 1 | GAP | **79.66** | 79.08 | 78.65 | −0.58 | −1.01 | **72.15** | 71.54 | 71.05 | −0.61 | −1.10 |
+| 3 | GAP | 84.53 | **84.57** | 84.01 | +0.04 | −0.52 | **77.25** | 77.15 | 76.48 | −0.10 | −0.77 |
+| 5 | GAP | **83.95** | 83.72 | 83.03 | −0.23 | −0.92 | **76.90** | 76.61 | 75.69 | −0.29 | −1.21 |
+| 3 | spatial | **84.04** | 83.97 | 83.26 | −0.07 | −0.78 | **76.59** | 76.39 | 75.66 | −0.20 | −0.93 |
+| 5 | spatial | **85.09** | 84.87 | 84.04 | −0.22 | −1.05 | **77.66** | 77.40 | 76.52 | −0.26 | −1.14 |
+
+分数据集 **Dice**（SAM1 / SAM2 / Δ）：
+
+| K | 检索 | Kvasir | Clinic | Colon | ETIS |
+|---|------|--------|--------|-------|------|
+| 1 | GAP | 72.96 / 72.14 / −0.82 | 85.98 / 84.81 / −1.17 | 83.09 / 83.55 / +0.46 | 87.10 / 87.49 / +0.39 |
+| 3 | GAP | 81.63 / 81.31 / −0.32 | 85.82 / 85.43 / −0.39 | 88.08 / **89.09** / +1.01 | 88.34 / **89.61** / +1.27 |
+| 5 | GAP | 82.31 / 82.04 / −0.27 | 85.12 / 83.83 / −1.29 | 83.96 / 84.80 / +0.84 | 88.46 / **89.76** / +1.30 |
+| 3 | spatial | 81.55 / 80.90 / −0.65 | 87.16 / 86.81 / −0.35 | 82.92 / 84.11 / +1.19 | 88.95 / **90.28** / +1.33 |
+| 5 | spatial | 82.41 / 81.65 / −0.76 | 87.32 / 87.08 / −0.24 | 86.90 / 87.60 / +0.70 | 88.13 / 88.97 / +0.84 |
+
+简要结论：**加权 All Dice 上 SAM2 与 SAM1 几乎持平**（−0.07～−0.58，仅 k3 GAP +0.04）；**Colon / ETIS 上 SAM2 多数略高**，**Kvasir / matched Clinic 略低**。精修换 SAM2.1 未带来整体超越 SAM1-h，但 **未明显劣于 SAM1**（相对 SAM3 的 ~0.5–2pt 落差）。
+
 #### 精修 backbone：SAM 3（`MedicalSAM3/checkpoint/sam3.pt`）
 
 
@@ -119,7 +166,7 @@ Following the extraction of an initial mask, we use numerical methods to generat
 | 3 | spatial | 82.15 | 74.25 | 78.14 | 69.70 | 85.85 | 78.64 | 83.28 | 75.63 | 88.56 | 80.82 |
 | 5 | spatial | 82.76 | 75.02 | 79.47 | 71.61 | 84.41 | 77.26 | 86.25 | 77.91 | 87.47 | 79.66 |
 
-结论：整体比ProtoSAM 低了2个点。但这不太公平，因为protosam的prompt是bbox和点（sam1不接受 text prompt）
+结论：整体比ProtoSAM 低了2个点。但这不太公平，因为protosam的prompt是bbox和点（sam1不接受 text prompt），而sam3的prompt没有给点，给的是 text + image（bbox） prompt
 
 **精修提示：T+I + Conf/Cent 前景点**
 

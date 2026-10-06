@@ -340,12 +340,17 @@ def get_model(_config) -> ProtoSAM:
         raise NotImplementedError(f"base model {_config['base_model']} not implemented")
     
     # ProtoSAM model
-    if _config["protosam_sam_ver"] in ("sam_h", "sam_b", "sam3"):
+    if _config["protosam_sam_ver"] in ("sam_h", "sam_b", "sam2", "sam3"):
         sam_h_checkpoint = "pretrained_model/sam_vit_h.pth"
         sam_b_checkpoint = "pretrained_model/sam_vit_b.pth"
         default_sam3 = "/share/home/huafuchen01/huangwei/WangRuiFeng/MedicalSAM3/checkpoint/sam3.pt"
+        default_sam2 = (
+            "/share/home/huafuchen01/huangwei/XiongYiming/memory-sam/checkpoints/sam2.1_hiera_large.pt"
+        )
         if _config["protosam_sam_ver"] == "sam3":
             sam_checkpoint = _config.get("sam3_checkpoint") or default_sam3
+        elif _config["protosam_sam_ver"] == "sam2":
+            sam_checkpoint = _config.get("sam2_checkpoint") or default_sam2
         elif _config["protosam_sam_ver"] == "sam_h":
             sam_checkpoint = sam_h_checkpoint
         else:
@@ -368,7 +373,10 @@ def get_model(_config) -> ProtoSAM:
                     candidate_audit=_config.get("candidate_audit", False),
                     candidate_audit_thresholds=_config.get(
                         "candidate_audit_thresholds", (0.3, 0.4, 0.5)
-                    ),) 
+                    ),
+                    protosam_sam_ver=_config["protosam_sam_ver"],
+                    sam2_config=_config.get("sam2_config"),
+                    ) 
     elif _config["protosam_sam_ver"] == "medsam":
         model = ProtoMedSAM(image_size = (1024, 1024),
                             coarse_segmentation_model=base_model,

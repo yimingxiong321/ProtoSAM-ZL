@@ -1,0 +1,6 @@
+# Optional: only needed for modelname=dinov3_l16 (HF DINOv3 ViT-L/16).
+# Install on top of your ProtoSAM env, e.g.:
+#   pip install -r requirements-dinov3.txt
+transformers>=4.56,<4.57
+tokenizers>=0.21,<0.24
+safetensors>=0.4.0
