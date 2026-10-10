@@ -32,6 +32,8 @@ from models.qspa import (
 from models.polyp_support import (
     build_support_pool_by_dataset,
     pool_summary,
+    random_support_indices,
+    load_supports_from_indices,
     resolve_pool_indices,
     resolve_query_dataset,
     select_random_matched_support,
@@ -431,6 +433,45 @@ def apply_polyp_colon_etis_split(te_dataset: PolypDataset, split_dir: str, eval_
     return support_pairs
 
 
+POLYP_FOUR_SET_DATASETS = ("Kvasir", "CVC-ClinicDB", "CVC-ColonDB", "ETIS-LaribPolypDB")
+POLYP_SPLIT_DATASETS = ("CVC-ColonDB", "ETIS-LaribPolypDB")
+
+
+def apply_polyp_four_set_split(te_dataset: PolypDataset, split_dir: str, eval_datasets):
+    """Four-set pool (Protocol A four-set): one support pool over all four datasets.
+
+    - Kvasir / ClinicDB: keep original test images from te_dataset.
+    - ColonDB / ETIS: test = 10% query split; their 90% split is added to the pool.
+    Returns the Colon/ETIS support pairs (caller merges with Kvasir+Clinic train pool).
+    """
+    if eval_datasets is None:
+        eval_datasets = list(POLYP_FOUR_SET_DATASETS)
+    if isinstance(eval_datasets, str):
+        eval_datasets = [eval_datasets]
+    split_dir = os.path.abspath(split_dir)
+    split_names = [n for n in eval_datasets if n in POLYP_SPLIT_DATASETS]
+    keep_names = [n for n in eval_datasets if n not in POLYP_SPLIT_DATASETS]
+
+    keep_img, keep_gt = [], []
+    for img, gt in zip(te_dataset.images, te_dataset.gts):
+        if any(name in img for name in keep_names):
+            keep_img.append(img)
+            keep_gt.append(gt)
+
+    support_pairs = []
+    for name in split_names:
+        support_pairs.extend(load_polyp_path_pairs(os.path.join(split_dir, f"{name}_support.txt")))
+        test_pairs = load_polyp_path_pairs(os.path.join(split_dir, f"{name}_test.txt"))
+        keep_img.extend(p[0] for p in test_pairs)
+        keep_gt.extend(p[1] for p in test_pairs)
+
+    te_dataset.images = keep_img
+    te_dataset.gts = keep_gt
+    te_dataset.size = len(keep_img)
+    te_dataset.filter_files_and_get_ds_mean_and_std()
+    return support_pairs
+
+
 def get_support_set_polyps(_config, dataset:PolypDataset):
     n_support = _config["n_support"]
     text_file = _config.get("support_txt_file", None)
@@ -577,6 +618,7 @@ def main(_run, _config, _log):
     spatial_chunk_size = int(_config.get("support_spatial_chunk_size", 64))
     polyp_match_support = bool(_config.get("polyp_match_support_to_query", False))
     polyp_unmatched_policy = _config.get("polyp_unmatched_support_policy", "skip")
+    polyp_four_set = bool(_config.get("polyp_four_set_pool", False))
     print(
         f"config do_cca: {_config['do_cca']}, use_bbox: {_config['use_bbox']}, "
         f"support_select_mode: {_config.get('support_select_mode', 'random')}, "
@@ -603,7 +645,16 @@ def main(_run, _config, _log):
         eval_ds = _config.get("polyp_eval_datasets", None)
         colon_etis_support_pairs = None
         split_dir = _config.get("polyp_colon_etis_split_dir")
-        if split_dir:
+        if split_dir and polyp_four_set:
+            eval_ds = _config.get("polyp_eval_datasets")
+            colon_etis_support_pairs = apply_polyp_four_set_split(
+                te_dataset, split_dir, eval_ds)
+            _config["_colon_etis_support_pairs"] = colon_etis_support_pairs
+            _log.info(
+                f'Polyp four-set pool from {split_dir}: '
+                f'test={te_dataset.size} colon_etis_support={len(colon_etis_support_pairs)}'
+            )
+        elif split_dir:
             eval_ds = _config.get("polyp_eval_datasets")
             colon_etis_support_pairs = apply_polyp_colon_etis_split(
                 te_dataset, split_dir, eval_ds)
@@ -702,9 +753,13 @@ def main(_run, _config, _log):
             polyp_support_features = polyp_support_features.cuda()
     elif is_alp_ds:
         all_support_images, all_support_fg_mask, support_scan_id = get_support_set(_config, te_dataset)
-    elif is_polyp_ds and (uses_dino_support_pool(support_selection) or polyp_match_support):
+    elif is_polyp_ds and (uses_dino_support_pool(support_selection) or polyp_match_support or polyp_four_set):
         colon_etis_support_pairs = _config.get("_colon_etis_support_pairs")
-        if colon_etis_support_pairs is not None:
+        if polyp_four_set:
+            polyp_pool_paths = tr_dataset.get_support_pool_paths(
+                text_file=_config.get("support_txt_file", None)
+            ) + list(colon_etis_support_pairs)
+        elif colon_etis_support_pairs is not None:
             polyp_pool_paths = list(colon_etis_support_pairs)
         else:
             polyp_pool_paths = tr_dataset.get_support_pool_paths(
@@ -725,6 +780,16 @@ def main(_run, _config, _log):
                 retrieval_mode=support_retrieval_mode)
             if support_retrieval_mode == "gap":
                 polyp_support_features = polyp_support_features.cuda()
+        elif polyp_four_set:
+            # Random baseline on four-set pool: one fixed support for all queries (seed-based).
+            fixed_idx = random_support_indices(
+                list(range(len(polyp_pool_paths))), n_support=1,
+                seed=_config.get("seed", 42), query_index=0)
+            support_images, support_fg_mask, fixed_cases = load_supports_from_indices(
+                fixed_idx, polyp_pool_paths, tr_dataset.load_support_item)
+            _log.info(
+                f'Four-set random fixed support: idx={fixed_idx} '
+                f'pool={len(polyp_pool_paths)} case={fixed_cases}')
     elif is_polyp_ds:
         support_images, support_fg_mask, case = get_support_set_polyps(_config, tr_dataset)
         

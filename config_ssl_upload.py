@@ -107,7 +107,7 @@ def cfg():
     use_neg_points=False
     n_support=1 # num support images
     support_select_mode="random" # random | dino_sim (legacy; dino_sim maps to support_selection=top1)
-    support_selection="random" # random | top1 | topk_weighted (QSPA multi-support fusion)
+    support_selection="random" # random | top1 | bottom1 | topk_weighted (QSPA multi-support fusion)
     top_k=5 # used only when support_selection=topk_weighted (ignored for top1)
     prototype_temperature=0.07 # softmax temperature over top-K DINOv2 cosine sims
     support_retrieval_mode="gap" # gap | spatial (spatial uses DINO feature-map similarity)
@@ -116,6 +116,7 @@ def cfg():
     polyp_unmatched_support_policy="skip" # skip | fallback_all | error when train pool missing (Colon/ETIS)
     polyp_eval_datasets=None # None=all; e.g. ['CVC-ColonDB'] to eval a subset
     polyp_colon_etis_split_dir=None # dir with {Dataset}_support.txt and {Dataset}_test.txt (9:1 split)
+    polyp_four_set_pool=False # True (Protocol A four-set): pool = K+C train + Colon/ETIS 90% split; test = K/C original + Colon/ETIS 10% split
     protosam_sam_ver="sam_h" # sam_h | sam_b | sam2 | sam3 | medsam
     sam2_checkpoint="/share/home/huafuchen01/huangwei/XiongYiming/memory-sam/checkpoints/sam2.1_hiera_large.pt"
     sam2_config=None # optional hydra config_name; default from checkpoint basename

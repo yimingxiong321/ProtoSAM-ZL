@@ -1,11 +1,19 @@
 # Python / IDE
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .vscode/
 .idea/
 debug/
+.DS_Store
+*.swp
+*~
 
 # Cursor / local indexing
+.cursor/
 .cursorindexingignore
 .specstory/
 
@@ -13,6 +21,10 @@ debug/
 exps/
 test_*/
 results/
+outputs/
+output/
+checkpoints/
+wandb/
 scripts/
 official_benchmark_rerun/
 fivefold_logs/
@@ -24,13 +36,19 @@ presence_operator_eval/
 presence_percentile_fusion/
 presence_srqs_eval/
 
+# Sacred / local run snapshots (often huge)
+**/mySSL_*/
+**/_sources/
+**/interm_preds/
+**/cout.txt
+
 # Models & weights
-pretrained_model/*
-!pretrained_model/.gitkeep
+pretrained_model/
 *.pth
 *.pt
 *.ckpt
 *.safetensors
+*.onnx
 
 # Datasets & archives
 data/
@@ -40,6 +58,7 @@ FAME-main.zip
 fame_protosam/
 fame_protosam.zip
 ProtoSAM-main.zip
+*.zip
 
 # Logs & scratch
 *.log
@@ -48,6 +67,13 @@ spen_log.txt
 presence_scores.csv
 *.bak
 
-# Large binaries
+# Large binaries / docs
 *.pdf
-*.zip
+*.npy
+*.npz
+*.h5
+*.nii
+*.nii.gz
+
+# One-off agent prompt dumps at repo root (keep README.md, result.md, spen.md)
+请*.md

@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 
-VALID_SUPPORT_SELECTION = ("random", "top1", "topk_weighted")
+VALID_SUPPORT_SELECTION = ("random", "top1", "bottom1", "topk_weighted")
 VALID_RETRIEVAL_MODES = ("gap", "spatial")
 
 
@@ -20,7 +20,7 @@ def resolve_support_selection(config):
     """
     sel = config.get("support_selection", "random")
     legacy = config.get("support_select_mode", "random")
-    if sel in ("top1", "topk_weighted"):
+    if sel in ("top1", "bottom1", "topk_weighted"):
         return sel
     if sel == "random" and legacy == "dino_sim":
         return "top1"
@@ -30,11 +30,11 @@ def resolve_support_selection(config):
 
 
 def uses_dino_support_pool(selection):
-    return selection in ("top1", "topk_weighted")
+    return selection in ("top1", "bottom1", "topk_weighted")
 
 
 def selection_top_k(selection, top_k):
-    if selection == "top1":
+    if selection in ("top1", "bottom1"):
         return 1
     return max(1, int(top_k))
 
@@ -169,6 +169,60 @@ rank_supports_by_dino_sim = rank_supports_by_gap_sim
 
 
 @torch.no_grad()
+def select_bottom1_supports_by_dino_sim(
+    encoder,
+    query_images,
+    support_features,
+    pool_paths=None,
+    dataset=None,
+    pool_indices=None,
+    query_dataset=None,
+    retrieval_mode="gap",
+    spatial_chunk_size=64,
+    load_support_fn=None,
+):
+    """DINO bottom-1 (lowest similarity) retrieval, k=1, no fusion."""
+    ranked_sims, order = rank_supports(
+        encoder, query_images, support_features,
+        retrieval_mode=retrieval_mode,
+        pool_indices=pool_indices,
+        spatial_chunk_size=spatial_chunk_size,
+    )
+    idx = order[-1:]
+    sims = ranked_sims[-1:]
+    weights = aggregation_weights(sims, temperature=1.0)
+
+    images, masks, cases = [], [], []
+    for i in idx.tolist():
+        if load_support_fn is not None:
+            img, mask, case = load_support_fn(int(i))
+        elif pool_paths is not None and dataset is not None:
+            img, mask, case = dataset.load_support_item(*pool_paths[i])
+        else:
+            raise ValueError(
+                "select_bottom1_supports requires load_support_fn or pool_paths+dataset")
+        images.append(img)
+        masks.append(mask)
+        cases.append(case)
+
+    info = {
+        "selected_indices": idx.tolist(),
+        "selected_similarities": [float(x) for x in sims.detach().cpu()],
+        "weights": [float(x) for x in weights.detach().cpu()],
+        "ranked": [(int(i), float(s), float(w)) for i, s, w in zip(
+            idx.tolist(), sims.tolist(), weights.tolist())],
+        "n_pool": int(len(pool_indices) if pool_indices is not None else ranked_sims.numel()),
+        "top_k": 1,
+        "temperature": 1.0,
+        "query_dataset": query_dataset,
+        "retrieval_mode": retrieval_mode,
+        "pool_indices": list(pool_indices) if pool_indices is not None else None,
+        "all_similarities": ranked_sims.detach().cpu(),
+    }
+    return images, masks, cases, weights, info
+
+
+@torch.no_grad()
 def select_top1_supports_by_dino_sim(
     encoder,
     query_images,
@@ -218,6 +272,19 @@ def select_supports_by_dino_sim(
     selection = resolve_support_selection({"support_selection": support_selection})
     if selection == "top1":
         return select_top1_supports_by_dino_sim(
+            encoder,
+            query_images,
+            support_features,
+            pool_paths=pool_paths,
+            dataset=dataset,
+            pool_indices=pool_indices,
+            query_dataset=query_dataset,
+            retrieval_mode=retrieval_mode,
+            spatial_chunk_size=spatial_chunk_size,
+            load_support_fn=load_support_fn,
+        )
+    if selection == "bottom1":
+        return select_bottom1_supports_by_dino_sim(
             encoder,
             query_images,
             support_features,
